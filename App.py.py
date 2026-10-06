@@ -488,6 +488,21 @@ def separar_observacao_feedback(observacao):
     return base, feedback
 
 
+def atualizar_tipo_treino(
+    id_treino,
+    novo_tipo,
+):
+    return supabase_update(
+        "treinos",
+        {
+            "id": f"eq.{int(id_treino)}"
+        },
+        {
+            "tipo": str(novo_tipo),
+        },
+    )
+
+
 def atualizar_feedback_treino(
     id_treino,
     esforco,
@@ -2040,15 +2055,17 @@ def atividades_recentes_coach(
                 plano = None
 
             if plano is not None:
+                tipo_planejado = str(
+                    plano.get(
+                        "tipo",
+                        "",
+                    )
+                )
+
                 item[
                     "treino_planejado_associado"
                 ] = {
-                    "tipo": str(
-                        plano.get(
-                            "tipo",
-                            "",
-                        )
-                    ),
+                    "tipo": tipo_planejado,
                     "distancia_km": round(
                         float(
                             plano.get(
@@ -2072,6 +2089,18 @@ def atividades_recentes_coach(
                         or None
                     ),
                 }
+
+                item[
+                    "tipo_real_diferente_do_planejado"
+                ] = (
+                    str(
+                        treino.get(
+                            "tipo",
+                            "",
+                        )
+                    )
+                    != tipo_planejado
+                )
 
         itens.append(item)
 
@@ -2716,8 +2745,13 @@ Regras:
   desconforto, RPE alto ou dado recente justificar;
 - em intervalados, pace_medio_atividade inclui aquecimento/recuperação:
   NÃO use esse número como ritmo dos tiros;
+- tipo_registrado é o treino REAL e pode ter sido corrigido manualmente pelo corredor;
+- treino_planejado_associado descreve apenas o que estava previsto. Se
+  tipo_real_diferente_do_planejado=true, priorize o tipo REAL e trate a diferença
+  como informação de aderência, não como erro de classificação;
 - se houver treino_planejado_associado ou intervalados_recentes, use o pace dos tiros
-  e a estrutura planejada como referência específica;
+  e a estrutura planejada como referência específica somente quando forem compatíveis
+  com o tipo REAL;
 - respeite datas, número de treinos e todos os limites;
 - máximo de sessões fortes = limite recebido; deixe >=48 h entre elas;
 - maior corrida recente é referência, não teto: quando fadiga/desconforto permitem,
@@ -2997,11 +3031,13 @@ dias_curtos = {
 
 tipos_treino = [
     "Rodagem leve",
+    "Recuperação",
     "Progressivo",
     "Intervalado",
     "Longão",
     "Tempo Run",
     "Teste 5 km",
+    "Corrida",
     "Outro",
 ]
 
@@ -3939,6 +3975,62 @@ with historico_tab:
                     f"### {treino['tipo']}"
                 )
 
+                with st.expander(
+                    "Editar tipo do treino"
+                ):
+                    tipo_atual = str(
+                        treino.get(
+                            "tipo",
+                            "Corrida",
+                        )
+                    )
+
+                    opcoes_tipo = list(
+                        tipos_treino
+                    )
+
+                    if tipo_atual not in opcoes_tipo:
+                        opcoes_tipo.append(
+                            tipo_atual
+                        )
+
+                    indice_tipo = opcoes_tipo.index(
+                        tipo_atual
+                    )
+
+                    with st.form(
+                        f"editar_tipo_{int(treino['id'])}"
+                    ):
+                        novo_tipo = st.selectbox(
+                            "Qual foi o treino de verdade?",
+                            options=opcoes_tipo,
+                            index=indice_tipo,
+                            help=(
+                                "Essa classificação é do treino realizado. "
+                                "Ela pode ser diferente do que estava planejado."
+                            ),
+                        )
+
+                        salvar_tipo = st.form_submit_button(
+                            "Atualizar tipo",
+                            width="stretch",
+                        )
+
+                        if salvar_tipo:
+                            atualizar_tipo_treino(
+                                treino["id"],
+                                novo_tipo,
+                            )
+
+                            st.session_state[
+                                "mensagem"
+                            ] = (
+                                "Tipo do treino atualizado. "
+                                "O Coach usará essa classificação daqui para frente."
+                            )
+
+                            st.rerun()
+
                 if c2.button(
                     "🗑️",
                     key=(
@@ -4065,6 +4157,48 @@ with historico_tab:
                         f"Esforço percebido: "
                         f"{int(float(esforco_atual))}/10"
                     )
+
+                planejamento_id_atual = treino.get(
+                    "planejamento_id"
+                )
+
+                if (
+                    planejamento_id_atual is not None
+                    and not pd.isna(
+                        planejamento_id_atual
+                    )
+                    and not planejamento.empty
+                ):
+                    try:
+                        plano_ligado = planejamento[
+                            pd.to_numeric(
+                                planejamento["id"],
+                                errors="coerce",
+                            )
+                            == int(
+                                planejamento_id_atual
+                            )
+                        ]
+
+                        if not plano_ligado.empty:
+                            tipo_planejado = str(
+                                plano_ligado.iloc[0][
+                                    "tipo"
+                                ]
+                            )
+
+                            if tipo_planejado != str(
+                                treino.get(
+                                    "tipo",
+                                    "",
+                                )
+                            ):
+                                st.caption(
+                                    f"Planejado: {tipo_planejado} · "
+                                    f"Realizado/classificado: {treino['tipo']}"
+                                )
+                    except Exception:
+                        pass
 
                 if observacao_base:
                     st.caption(
