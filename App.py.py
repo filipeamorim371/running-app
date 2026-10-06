@@ -1,4 +1,5 @@
 import hashlib
+import json
 import hmac
 import time
 from datetime import datetime, date, timedelta
@@ -10,7 +11,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 
 
 # =========================================================
@@ -19,74 +19,12 @@ import streamlit.components.v1 as components
 
 LOGO_PATH = Path("logo.png")
 
-# URL pública do mesmo escudo que está no repositório.
-# O parâmetro ?v= força Safari/iOS a buscar uma versão nova do ícone.
-IOS_ICON_URL = (
-    "https://raw.githubusercontent.com/"
-    "filipeamorim371/running-app/main/logo.png"
-    "?v=20261006-3"
-)
-
 st.set_page_config(
     page_title="Running",
-    page_icon=IOS_ICON_URL,
+    page_icon=str(LOGO_PATH) if LOGO_PATH.exists() else "🏃",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
-
-
-def configurar_icone_iphone():
-    """
-    O favicon do Streamlit e o ícone da Tela de Início do iPhone
-    são coisas diferentes. Este trecho adiciona apple-touch-icon
-    e metadados mobile diretamente ao <head> da página.
-    """
-    components.html(
-        f"""
-        <script>
-        (() => {{
-            const doc = window.parent.document;
-            const iconUrl = "{IOS_ICON_URL}";
-
-            function upsertLink(rel, href, sizes = null) {{
-                let el = doc.querySelector(`link[rel="${{rel}}"]`);
-                if (!el) {{
-                    el = doc.createElement("link");
-                    el.setAttribute("rel", rel);
-                    doc.head.appendChild(el);
-                }}
-                el.setAttribute("href", href);
-                if (sizes) el.setAttribute("sizes", sizes);
-            }}
-
-            function upsertMeta(name, content) {{
-                let el = doc.querySelector(`meta[name="${{name}}"]`);
-                if (!el) {{
-                    el = doc.createElement("meta");
-                    el.setAttribute("name", name);
-                    doc.head.appendChild(el);
-                }}
-                el.setAttribute("content", content);
-            }}
-
-            upsertLink("apple-touch-icon", iconUrl, "180x180");
-            upsertLink("icon", iconUrl);
-
-            upsertMeta("apple-mobile-web-app-capable", "yes");
-            upsertMeta("apple-mobile-web-app-status-bar-style", "default");
-            upsertMeta("apple-mobile-web-app-title", "Running");
-            upsertMeta("mobile-web-app-capable", "yes");
-            upsertMeta("theme-color", "#7A263A");
-
-            doc.title = "Running";
-        }})();
-        </script>
-        """,
-        height=0,
-    )
-
-
-configurar_icone_iphone()
 
 st.markdown(
     """
@@ -224,6 +162,18 @@ except Exception:
         "Confira as seções [supabase], [strava] e [app]."
     )
     st.stop()
+
+
+# OpenAI é opcional: o restante do app continua funcionando sem a chave.
+try:
+    OPENAI_API_KEY = st.secrets["openai"]["api_key"]
+except Exception:
+    OPENAI_API_KEY = None
+
+try:
+    OPENAI_MODEL = st.secrets["openai"]["model"]
+except Exception:
+    OPENAI_MODEL = "gpt-5.6-terra"
 
 
 # =========================================================
@@ -1809,6 +1759,502 @@ def salvar_plano_coach(
     )
 
 
+
+# =========================================================
+# COACH IA
+# =========================================================
+
+DIAS_OFFSET = {
+    "Seg": 0,
+    "Ter": 1,
+    "Qua": 2,
+    "Qui": 3,
+    "Sex": 4,
+    "Sáb": 5,
+    "Dom": 6,
+}
+
+
+def proxima_segunda(hoje_local):
+    return hoje_local + timedelta(
+        days=(7 - hoje_local.weekday())
+    )
+
+
+def datas_disponiveis_coach(hoje_local, dias_escolhidos):
+    inicio = proxima_segunda(hoje_local)
+    return sorted(
+        [
+            inicio + timedelta(days=DIAS_OFFSET[dia])
+            for dia in dias_escolhidos
+        ]
+    )
+
+
+def resumo_semanal_coach(historico_df, hoje_local, semanas=8):
+    df = deduplicar_historico_coach(historico_df)
+    inicio_semana_atual = hoje_local - timedelta(days=hoje_local.weekday())
+    resultado = []
+
+    for i in range(semanas, 0, -1):
+        inicio = inicio_semana_atual - timedelta(days=7 * i)
+        fim = inicio + timedelta(days=6)
+
+        if df.empty:
+            bloco = pd.DataFrame()
+        else:
+            bloco = df[
+                (df["data_dt"] >= inicio)
+                & (df["data_dt"] <= fim)
+            ]
+
+        if bloco.empty:
+            resultado.append(
+                {
+                    "inicio": str(inicio),
+                    "fim": str(fim),
+                    "treinos": 0,
+                    "km": 0.0,
+                    "maior_corrida_km": 0.0,
+                }
+            )
+            continue
+
+        resultado.append(
+            {
+                "inicio": str(inicio),
+                "fim": str(fim),
+                "treinos": int(len(bloco)),
+                "km": round(float(bloco["distancia"].sum()), 1),
+                "maior_corrida_km": round(float(bloco["distancia"].max()), 1),
+            }
+        )
+
+    return resultado
+
+
+def atividades_recentes_coach(historico_df, hoje_local, limite=24):
+    if historico_df.empty:
+        return []
+
+    df = deduplicar_historico_coach(historico_df)
+    df = df[df["data_dt"] >= hoje_local - timedelta(days=56)].copy()
+    df = df.sort_values("data_plot", ascending=False).head(limite)
+
+    itens = []
+
+    for _, treino in df.iterrows():
+        item = {
+            "data": str(treino.get("data", "")),
+            "tipo_registrado": str(treino.get("tipo", "Corrida")),
+            "distancia_km": round(float(treino.get("distancia", 0) or 0), 2),
+            "pace_medio": treino.get("pace") or None,
+            "origem": treino.get("origem") or None,
+        }
+
+        for origem_coluna, destino in [
+            ("duracao_seg", "duracao_seg"),
+            ("elevacao_m", "elevacao_m"),
+            ("frequencia_cardiaca_media", "fc_media"),
+            ("esforco", "rpe"),
+        ]:
+            valor = treino.get(origem_coluna)
+            if valor is not None and not pd.isna(valor):
+                try:
+                    item[destino] = round(float(valor), 1)
+                except Exception:
+                    item[destino] = valor
+
+        itens.append(item)
+
+    return itens
+
+
+def aderencia_recente_coach(planejamento_df, historico_df, hoje_local):
+    if planejamento_df.empty:
+        return {
+            "planejados": 0,
+            "concluidos": 0,
+            "aderencia_pct": None,
+        }
+
+    inicio = hoje_local - timedelta(days=28)
+    planos = planejamento_df[
+        (planejamento_df["data_dt"] >= inicio)
+        & (planejamento_df["data_dt"] <= hoje_local)
+    ]
+
+    if planos.empty:
+        return {
+            "planejados": 0,
+            "concluidos": 0,
+            "aderencia_pct": None,
+        }
+
+    concluidos = 0
+
+    for _, treino in planos.iterrows():
+        if realizado_do_planejado(treino, historico_df) is not None:
+            concluidos += 1
+
+    return {
+        "planejados": int(len(planos)),
+        "concluidos": int(concluidos),
+        "aderencia_pct": round(100 * concluidos / len(planos)),
+    }
+
+
+def limites_coach_ia(estado, perfil_semana, fadiga, desconforto):
+    base = max(float(estado["volume_base"]), 1.0)
+
+    if perfil_semana == "Conservador":
+        minimo = base * 0.75
+        maximo = min(base * 1.03, base + 2.0)
+    elif perfil_semana == "Agressivo":
+        minimo = base * 0.90
+        maximo = min(base * 1.18, base + 5.0)
+    else:
+        minimo = base * 0.82
+        maximo = min(base * 1.12, base + 4.0)
+
+    if fadiga >= 8:
+        maximo = min(maximo, base * 0.82)
+        minimo = min(minimo, maximo * 0.85)
+    elif fadiga >= 6:
+        maximo = min(maximo, base * 0.98)
+
+    if desconforto == "Moderado/forte":
+        maximo = min(maximo, base * 0.75)
+        minimo = min(minimo, maximo * 0.85)
+        max_fortes = 0
+    elif desconforto == "Leve":
+        max_fortes = 1
+    else:
+        max_fortes = 2 if fadiga <= 6 else 1
+
+    longao_max = min(
+        max(float(estado["maior_corrida_14"]) + 2.0, 6.0),
+        maximo * 0.36,
+    )
+
+    return {
+        "volume_min_km": round(max(8.0, minimo), 1),
+        "volume_max_km": round(max(10.0, maximo), 1),
+        "longao_max_km": round(max(5.0, longao_max), 1),
+        "max_sessoes_fortes": int(max_fortes),
+        "min_intervalo_horas_entre_fortes": 48,
+    }
+
+
+def contexto_coach_ia(
+    historico_df,
+    planejamento_df,
+    hoje_local,
+    n_treinos,
+    dias_escolhidos,
+    perfil_semana,
+    fadiga,
+    desconforto,
+    mensagem_coach,
+):
+    estado = analisar_estado_coach(historico_df, hoje_local)
+    datas = datas_disponiveis_coach(hoje_local, dias_escolhidos)
+    limites = limites_coach_ia(
+        estado,
+        perfil_semana,
+        fadiga,
+        desconforto,
+    )
+
+    return {
+        "data_atual": str(hoje_local),
+        "objetivo": {
+            "prova": "5 km",
+            "meta": "sub-25:00",
+            "pace_meta": "4:59/km ou mais rápido",
+            "recorde_pessoal_informado": "24:20",
+        },
+        "pedido_para_proxima_semana": {
+            "numero_de_treinos": int(n_treinos),
+            "datas_disponiveis": [str(x) for x in datas],
+            "perfil": perfil_semana,
+            "fadiga_1a10": int(fadiga),
+            "desconforto": desconforto,
+            "mensagem_do_corredor": mensagem_coach.strip() or None,
+        },
+        "estado_calculado": {
+            "volume_base_km": round(float(estado["volume_base"]), 1),
+            "volume_ultimos_7_km": round(float(estado["volume_ultimos_7"]), 1),
+            "volume_ultimos_28_km": round(float(estado["volume_28"]), 1),
+            "treinos_ultimos_28": int(estado["treinos_28"]),
+            "maior_corrida_14_dias_km": round(float(estado["maior_corrida_14"]), 1),
+            "pace_referencia": segundos_para_pace(estado["pace_ref"]),
+            "pouco_historico_recente": bool(estado["modo_retorno"]),
+        },
+        "semanas_anteriores": resumo_semanal_coach(historico_df, hoje_local, 8),
+        "atividades_recentes": atividades_recentes_coach(historico_df, hoje_local, 24),
+        "aderencia_28_dias": aderencia_recente_coach(
+            planejamento_df,
+            historico_df,
+            hoje_local,
+        ),
+        "limites_obrigatorios": limites,
+    }
+
+
+def esquema_resposta_coach_ia(datas_permitidas):
+    return {
+        "type": "object",
+        "properties": {
+            "leitura_da_fase": {"type": "string"},
+            "estrategia_da_semana": {"type": "string"},
+            "volume_semana_km": {"type": "number"},
+            "alerta": {"type": "string"},
+            "treinos": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "data": {
+                            "type": "string",
+                            "enum": datas_permitidas,
+                        },
+                        "tipo": {
+                            "type": "string",
+                            "enum": [
+                                "Rodagem leve",
+                                "Recuperação",
+                                "Progressivo",
+                                "Intervalado",
+                                "Tempo Run",
+                                "Longão",
+                                "Teste 5 km",
+                            ],
+                        },
+                        "distancia_km": {"type": "number"},
+                        "pace_alvo": {"type": "string"},
+                        "estrutura": {"type": "string"},
+                        "intensidade": {
+                            "type": "string",
+                            "enum": ["leve", "moderada", "forte"],
+                        },
+                        "objetivo": {"type": "string"},
+                        "justificativa": {"type": "string"},
+                    },
+                    "required": [
+                        "data",
+                        "tipo",
+                        "distancia_km",
+                        "pace_alvo",
+                        "estrutura",
+                        "intensidade",
+                        "objetivo",
+                        "justificativa",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": [
+            "leitura_da_fase",
+            "estrategia_da_semana",
+            "volume_semana_km",
+            "alerta",
+            "treinos",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def extrair_texto_responses_api(payload_resposta):
+    for item in payload_resposta.get("output", []):
+        if item.get("type") != "message":
+            continue
+
+        for conteudo in item.get("content", []):
+            if conteudo.get("type") == "output_text":
+                return conteudo.get("text", "")
+
+            if conteudo.get("type") == "refusal":
+                raise RuntimeError(
+                    conteudo.get("refusal")
+                    or "A IA recusou gerar o plano."
+                )
+
+    raise RuntimeError("A API não retornou um plano em texto estruturado.")
+
+
+def chamar_openai_coach(contexto):
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "A chave da OpenAI ainda não foi configurada nos Secrets."
+        )
+
+    datas_permitidas = contexto["pedido_para_proxima_semana"]["datas_disponiveis"]
+    schema = esquema_resposta_coach_ia(datas_permitidas)
+
+    instrucoes = """
+Você é o motor de planejamento de um aplicativo pessoal de corrida.
+Sua função é criar UMA semana de treino coerente com os dados fornecidos.
+
+Princípios obrigatórios:
+- Use o histórico real como contexto. Não trate recorde pessoal antigo como condicionamento atual.
+- Priorize consistência e especificidade para 5 km, não volume por volume.
+- Diferencie pace médio de uma atividade de pace das repetições de um intervalado.
+- Não invente dados ausentes (FC, RPE, lesões, provas recentes).
+- Respeite exatamente as datas disponíveis e o número de treinos solicitado.
+- Respeite todos os limites obrigatórios recebidos no JSON.
+- No máximo o número permitido de sessões fortes.
+- Sessões fortes devem ficar separadas por pelo menos 48 horas.
+- O longão não pode ultrapassar longao_max_km.
+- O volume semanal deve ficar entre volume_min_km e volume_max_km.
+- A distância mostrada para intervalados deve representar aproximadamente o total corrido, incluindo aquecimento e desaquecimento.
+- Pace de rodagem leve deve ser confortável. Não force pace apenas para cumprir número.
+- Para meta sub-25, use trabalho específico de forma progressiva, sem transformar toda semana em teste.
+- Se fadiga estiver alta ou houver desconforto moderado/forte, reduza ou remova intensidade.
+- Não diagnostique nem trate condições médicas. Se houver desconforto relevante, use o campo alerta para recomendar cautela.
+- Explique de modo breve por que a semana faz sentido à luz do histórico.
+- Responda somente no schema estruturado solicitado.
+""".strip()
+
+    resposta = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": OPENAI_MODEL,
+            "reasoning": {"effort": "medium"},
+            "instructions": instrucoes,
+            "input": json.dumps(contexto, ensure_ascii=False),
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "running_coach_week",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+        },
+        timeout=75,
+    )
+
+    if not resposta.ok:
+        detalhe = resposta.text[:800]
+        raise RuntimeError(
+            f"OpenAI API respondeu {resposta.status_code}: {detalhe}"
+        )
+
+    texto = extrair_texto_responses_api(resposta.json())
+    return json.loads(texto)
+
+
+def validar_plano_coach_ia(plano, contexto):
+    erros = []
+    pedido = contexto["pedido_para_proxima_semana"]
+    limites = contexto["limites_obrigatorios"]
+    datas_permitidas = set(pedido["datas_disponiveis"])
+    treinos = plano.get("treinos", [])
+
+    if len(treinos) != pedido["numero_de_treinos"]:
+        erros.append(
+            f"Quantidade de treinos: esperado {pedido['numero_de_treinos']}, recebido {len(treinos)}."
+        )
+
+    datas = [str(t.get("data", "")) for t in treinos]
+
+    if len(set(datas)) != len(datas):
+        erros.append("Há dois treinos na mesma data.")
+
+    if any(data not in datas_permitidas for data in datas):
+        erros.append("O plano usou uma data não autorizada.")
+
+    try:
+        volume = sum(float(t.get("distancia_km", 0)) for t in treinos)
+    except Exception:
+        volume = -1
+
+    if volume < limites["volume_min_km"] - 0.6:
+        erros.append(
+            f"Volume {volume:.1f} km abaixo do mínimo {limites['volume_min_km']:.1f} km."
+        )
+
+    if volume > limites["volume_max_km"] + 0.6:
+        erros.append(
+            f"Volume {volume:.1f} km acima do máximo {limites['volume_max_km']:.1f} km."
+        )
+
+    fortes = [t for t in treinos if t.get("intensidade") == "forte"]
+
+    if len(fortes) > limites["max_sessoes_fortes"]:
+        erros.append(
+            f"Há {len(fortes)} sessões fortes; o máximo é {limites['max_sessoes_fortes']}."
+        )
+
+    longoes = [t for t in treinos if t.get("tipo") == "Longão"]
+    for t in longoes:
+        if float(t.get("distancia_km", 0)) > limites["longao_max_km"] + 0.1:
+            erros.append(
+                f"Longão de {float(t.get('distancia_km', 0)):.1f} km excede o limite de {limites['longao_max_km']:.1f} km."
+            )
+
+    fortes_ordenados = sorted(
+        fortes,
+        key=lambda x: x.get("data", ""),
+    )
+
+    for anterior, atual in zip(fortes_ordenados, fortes_ordenados[1:]):
+        try:
+            d1 = pd.to_datetime(anterior["data"]).date()
+            d2 = pd.to_datetime(atual["data"]).date()
+            if (d2 - d1).days < 2:
+                erros.append("Duas sessões fortes ficaram com menos de 48 h de intervalo.")
+        except Exception:
+            erros.append("Não foi possível validar as datas das sessões fortes.")
+
+    return erros
+
+
+def plano_ia_para_planejamento(plano_ia):
+    saida = []
+
+    for treino in plano_ia.get("treinos", []):
+        descricao = (
+            f"{treino['estrutura']} | Objetivo: {treino['objetivo']} | "
+            f"Por quê: {treino['justificativa']}"
+        )
+
+        saida.append(
+            {
+                "data": pd.to_datetime(treino["data"]).date(),
+                "tipo": treino["tipo"],
+                "distancia": float(treino["distancia_km"]),
+                "pace_alvo": treino["pace_alvo"],
+                "descricao": descricao,
+                "intensidade": treino["intensidade"],
+                "objetivo": treino["objetivo"],
+                "justificativa": treino["justificativa"],
+                "estrutura": treino["estrutura"],
+            }
+        )
+
+    return saida
+
+
+def gerar_plano_com_ia(contexto):
+    plano = chamar_openai_coach(contexto)
+    erros = validar_plano_coach_ia(plano, contexto)
+
+    if erros:
+        raise RuntimeError(
+            "A proposta da IA foi bloqueada pelo validador: "
+            + " ".join(erros)
+        )
+
+    return plano
+
+
 # =========================================================
 # CALLBACK STRAVA
 # =========================================================
@@ -3282,28 +3728,23 @@ with evolucao_tab:
 # =========================================================
 
 with coach_tab:
-    st.subheader(
-        "Coach adaptativo"
-    )
+    st.subheader("Coach IA")
 
     st.caption(
-        "O plano usa apenas sua carga recente, remove possíveis duplicatas "
-        "manual + Strava e limita progressão de volume e longão."
+        "O Coach cruza seu histórico sincronizado, carga recente, disponibilidade "
+        "e check-in. A IA propõe a semana; um validador independente bloqueia "
+        "planos fora dos limites definidos pelo app."
     )
 
-    estado_coach = (
-        analisar_estado_coach(
-            historico,
-            hoje,
-        )
+    estado_coach = analisar_estado_coach(
+        historico,
+        hoje,
     )
 
-    c1, c2, c3 = (
-        st.columns(3)
-    )
+    c1, c2, c3 = st.columns(3)
 
     c1.metric(
-        "Base semanal",
+        "Base recente",
         f"{estado_coach['volume_base']:.1f} km",
     )
 
@@ -3314,59 +3755,66 @@ with coach_tab:
 
     c3.metric(
         "Pace referência",
-        (
-            f"{segundos_para_pace(estado_coach['pace_ref'])}/km"
-        ),
+        f"{segundos_para_pace(estado_coach['pace_ref'])}/km",
     )
 
-    if estado_coach["modo_retorno"]:
-        st.info(
-            "Modo retorno ativo: o Coach está sendo conservador com "
-            "volume, longão e progressão porque ainda há pouco histórico "
-            "recente consistente."
+    if not OPENAI_API_KEY:
+        st.warning(
+            "A IA ainda não está conectada. Adicione a seção [openai] nos "
+            "Secrets do Streamlit para ativar o botão de geração."
+        )
+
+        st.code(
+            '[openai]\napi_key = "SUA_CHAVE_AQUI"\nmodel = "gpt-5.6-terra"',
+            language="toml",
+        )
+
+        st.caption(
+            "A chave deve ficar somente nos Secrets do Streamlit; não coloque "
+            "a chave no GitHub nem envie no chat."
         )
 
     st.write("")
 
-    with st.form(
-        "coach_form"
-    ):
-        n_treinos = (
-            st.select_slider(
-                "Quantos dias você pode correr na próxima semana?",
-                options=[
-                    3,
-                    4,
-                    5,
-                ],
-                value=4,
-            )
+    with st.form("coach_ia_form"):
+        n_treinos = st.select_slider(
+            "Quantos dias você pode correr na próxima semana?",
+            options=[3, 4, 5],
+            value=4,
         )
 
-        intensidade_semana = (
-            st.radio(
-                "Tipo de semana",
-                [
-                    "Leve",
-                    "Normal",
-                    "Progressiva",
-                ],
-                horizontal=True,
-                index=1,
-            )
+        perfil_semana = st.radio(
+            "Perfil da semana",
+            [
+                "Conservador",
+                "Equilibrado",
+                "Agressivo",
+            ],
+            horizontal=True,
+            index=1,
+            help=(
+                "Isso orienta a IA, mas não multiplica o volume de forma cega. "
+                "O histórico continua sendo o principal sinal."
+            ),
         )
 
-        fadiga = (
-            st.slider(
-                "Cansaço geral hoje",
-                min_value=1,
-                max_value=10,
-                value=4,
-                help=(
-                    "1 = muito descansado; "
-                    "10 = muito cansado."
-                ),
-            )
+        fadiga = st.slider(
+            "Cansaço geral hoje",
+            min_value=1,
+            max_value=10,
+            value=4,
+            help="1 = muito descansado; 10 = muito cansado.",
+        )
+
+        desconforto = st.radio(
+            "Dor ou desconforto para correr hoje",
+            [
+                "Nenhum",
+                "Leve",
+                "Moderado/forte",
+            ],
+            horizontal=True,
+            index=0,
         )
 
         opcoes_dias = [
@@ -3380,150 +3828,126 @@ with coach_tab:
         ]
 
         defaults = {
-            3: [
-                "Ter",
-                "Qui",
-                "Dom",
-            ],
-            4: [
-                "Seg",
-                "Qua",
-                "Sex",
-                "Dom",
-            ],
-            5: [
-                "Seg",
-                "Ter",
-                "Qui",
-                "Sáb",
-                "Dom",
-            ],
+            3: ["Ter", "Qui", "Dom"],
+            4: ["Seg", "Qua", "Sex", "Dom"],
+            5: ["Seg", "Ter", "Qui", "Sáb", "Dom"],
         }
 
-        dias_escolhidos = (
-            st.multiselect(
-                "Dias disponíveis",
-                options=opcoes_dias,
-                default=defaults[
-                    n_treinos
-                ],
-            )
+        dias_escolhidos = st.multiselect(
+            "Dias disponíveis",
+            options=opcoes_dias,
+            default=defaults[n_treinos],
         )
 
-        gerar = (
-            st.form_submit_button(
-                "Gerar próxima semana",
-                width="stretch",
-            )
+        mensagem_coach = st.text_area(
+            "Recado para o Coach (opcional)",
+            placeholder=(
+                "Ex.: domingo quero correr com amigos; quarta tenho pouco tempo; "
+                "prefiro não fazer tiros na sexta."
+            ),
         )
 
-        if gerar:
-            if (
-                len(
-                    dias_escolhidos
-                )
-                != n_treinos
-            ):
+        gerar_ia = st.form_submit_button(
+            "✨ Gerar semana com IA",
+            type="primary",
+            width="stretch",
+            disabled=not bool(OPENAI_API_KEY),
+        )
+
+        if gerar_ia:
+            if len(dias_escolhidos) != n_treinos:
                 st.warning(
-                    f"Escolha exatamente "
-                    f"{n_treinos} dias."
+                    f"Escolha exatamente {n_treinos} dias."
                 )
-
             else:
-                plano_gerado, estado_usado, volume_alvo = (
-                    gerar_plano_coach(
-                        historico,
-                        hoje,
-                        n_treinos,
-                        dias_escolhidos,
-                        intensidade_semana,
-                        fadiga,
-                    )
+                contexto = contexto_coach_ia(
+                    historico,
+                    planejamento,
+                    hoje,
+                    n_treinos,
+                    dias_escolhidos,
+                    perfil_semana,
+                    fadiga,
+                    desconforto,
+                    mensagem_coach,
                 )
 
-                st.session_state[
-                    "plano_coach"
-                ] = plano_gerado
+                try:
+                    with st.spinner(
+                        "Analisando seu histórico e montando a semana..."
+                    ):
+                        plano_ia = gerar_plano_com_ia(contexto)
 
-                st.session_state[
-                    "coach_volume_alvo"
-                ] = volume_alvo
+                    st.session_state["coach_ia_resultado"] = plano_ia
+                    st.session_state["coach_ia_contexto"] = contexto
+                    st.session_state["plano_coach"] = plano_ia_para_planejamento(plano_ia)
+                    st.rerun()
 
-                st.session_state[
-                    "coach_estado"
-                ] = estado_usado
+                except Exception as erro:
+                    st.error(
+                        "O Coach não conseguiu gerar um plano válido. "
+                        f"Detalhe: {erro}"
+                    )
 
-                st.rerun()
+    resultado_ia = st.session_state.get("coach_ia_resultado")
+    plano_coach = st.session_state.get("plano_coach")
+    contexto_ia = st.session_state.get("coach_ia_contexto")
 
-    plano_coach = (
-        st.session_state.get(
-            "plano_coach"
-        )
-    )
-
-    if plano_coach:
+    if resultado_ia and plano_coach:
         st.divider()
+        st.subheader("Próxima semana sugerida")
 
-        st.subheader(
-            "Próxima semana sugerida"
+        st.markdown(
+            f"**Leitura da sua fase:** {resultado_ia['leitura_da_fase']}"
+        )
+        st.markdown(
+            f"**Estratégia:** {resultado_ia['estrategia_da_semana']}"
         )
 
-        volume_alvo = (
-            st.session_state.get(
-                "coach_volume_alvo",
-                sum(
-                    treino[
-                        "distancia"
-                    ]
-                    for treino in plano_coach
-                ),
+        total_calculado = sum(
+            treino["distancia"]
+            for treino in plano_coach
+        )
+
+        m1, m2 = st.columns(2)
+        m1.metric("Volume sugerido", f"{total_calculado:.1f} km")
+
+        if contexto_ia:
+            limites = contexto_ia["limites_obrigatorios"]
+            m2.metric(
+                "Faixa validada",
+                f"{limites['volume_min_km']:.1f}–{limites['volume_max_km']:.1f} km",
             )
-        )
 
-        st.metric(
-            "Volume sugerido",
-            f"{volume_alvo:.1f} km",
-        )
-
-        if fadiga >= 8:
-            st.info(
-                "Como o cansaço informado está alto, "
-                "o plano reduz volume e remove sessões fortes."
-            )
+        if resultado_ia.get("alerta"):
+            st.info(resultado_ia["alerta"])
 
         for treino in plano_coach:
-            with st.container(
-                border=True
-            ):
+            with st.container(border=True):
                 st.caption(
                     f"{dias_completos[treino['data'].weekday()]} · "
-                    f"{treino['data'].strftime('%d/%m')}"
+                    f"{treino['data'].strftime('%d/%m')} · "
+                    f"{treino['intensidade'].upper()}"
                 )
 
-                st.markdown(
-                    f"### {treino['tipo']}"
-                )
+                st.markdown(f"### {treino['tipo']}")
 
-                a1, a2 = (
-                    st.columns(2)
-                )
-
+                a1, a2 = st.columns(2)
                 a1.metric(
                     "Distância",
                     f"{treino['distancia']:.1f} km",
                 )
-
                 a2.metric(
-                    "Pace",
-                    treino[
-                        "pace_alvo"
-                    ],
+                    "Pace / referência",
+                    treino["pace_alvo"],
                 )
 
+                st.write(treino["estrutura"])
                 st.caption(
-                    treino[
-                        "descricao"
-                    ]
+                    f"Objetivo: {treino['objetivo']}"
+                )
+                st.caption(
+                    f"Por que entrou: {treino['justificativa']}"
                 )
 
         st.write("")
@@ -3534,33 +3958,26 @@ with coach_tab:
             width="stretch",
         ):
             try:
-                salvos, pulados = (
-                    salvar_plano_coach(
-                        plano_coach,
-                        planejamento,
-                    )
+                salvos, pulados = salvar_plano_coach(
+                    plano_coach,
+                    planejamento,
                 )
 
-                st.session_state.pop(
+                for chave in [
                     "plano_coach",
-                    None,
-                )
+                    "coach_ia_resultado",
+                    "coach_ia_contexto",
+                ]:
+                    st.session_state.pop(chave, None)
 
-                texto = (
-                    f"{salvos} treino(s) "
-                    "salvo(s) na próxima semana."
-                )
+                texto = f"{salvos} treino(s) salvo(s) na próxima semana."
 
                 if pulados:
                     texto += (
-                        f" {pulados} data(s) "
-                        "já tinham treino e foram preservadas."
+                        f" {pulados} data(s) já tinham treino e foram preservadas."
                     )
 
-                st.session_state[
-                    "mensagem"
-                ] = texto
-
+                st.session_state["mensagem"] = texto
                 st.rerun()
 
             except Exception as erro:
@@ -3570,21 +3987,19 @@ with coach_tab:
                 )
 
         if st.button(
-            "Descartar sugestão",
+            "Gerar outra proposta",
             width="stretch",
         ):
-            st.session_state.pop(
+            for chave in [
                 "plano_coach",
-                None,
-            )
-
+                "coach_ia_resultado",
+                "coach_ia_contexto",
+            ]:
+                st.session_state.pop(chave, None)
             st.rerun()
 
     st.divider()
-
     st.caption(
-        "Versão 1 do Coach: regras adaptativas e seus dados reais. "
-        "A próxima evolução pode adicionar um modelo generativo para "
-        "explicar e personalizar o plano em linguagem natural, sem "
-        "remover os limites de segurança do motor."
+        "O Coach usa IA para interpretar contexto, mas não deixa a IA gravar "
+        "treinos diretamente. O plano só entra no calendário depois da sua aprovação."
     )
