@@ -1,8 +1,9 @@
 import hashlib
 import hmac
 import time
-from datetime import date, timedelta
+from datetime import datetime, date, timedelta
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -25,7 +26,7 @@ st.markdown(
     """
     <style>
     .block-container {
-        max-width: 820px;
+        max-width: 840px;
         padding-top: 1.1rem;
         padding-bottom: 4rem;
     }
@@ -61,6 +62,7 @@ try:
     STRAVA_REDIRECT_URI = st.secrets["strava"]["redirect_uri"]
 
     APP_PASSWORD = st.secrets["app"]["password"]
+
 except Exception:
     st.error(
         "Faltam configurações em Settings → Secrets. "
@@ -70,7 +72,7 @@ except Exception:
 
 
 # =========================================================
-# LOGIN DO APP
+# LOGIN
 # =========================================================
 
 def autenticar_app():
@@ -127,6 +129,7 @@ def supabase_insert(tabela, dados):
         **SUPABASE_HEADERS,
         "Prefer": "return=representation",
     }
+
     resposta = requests.post(
         f"{REST_URL}/{tabela}",
         headers=headers,
@@ -142,6 +145,7 @@ def supabase_update(tabela, filtros, dados):
         **SUPABASE_HEADERS,
         "Prefer": "return=representation",
     }
+
     resposta = requests.patch(
         f"{REST_URL}/{tabela}",
         headers=headers,
@@ -236,8 +240,8 @@ def salvar_planejamento(
             "data": str(data_treino),
             "tipo": tipo,
             "distancia": float(distancia),
-            "pace_alvo": pace_alvo.strip(),
-            "descricao": descricao.strip(),
+            "pace_alvo": pace_alvo.strip() if pace_alvo else "",
+            "descricao": descricao.strip() if descricao else "",
         },
     )
 
@@ -313,7 +317,7 @@ def excluir_treino(id_treino):
 
 
 # =========================================================
-# PACE E TEMPO
+# PACE / TEMPO
 # =========================================================
 
 def pace_para_segundos(pace):
@@ -345,6 +349,7 @@ def pace_para_segundos(pace):
             return None
 
         return minutos * 60 + segundos
+
     except (ValueError, TypeError):
         return None
 
@@ -364,12 +369,12 @@ def segundos_para_tempo(segundos):
     valor = int(round(float(segundos)))
     horas = valor // 3600
     minutos = (valor % 3600) // 60
-    segundos_restantes = valor % 60
+    resto = valor % 60
 
     if horas > 0:
-        return f"{horas}:{minutos:02d}:{segundos_restantes:02d}"
+        return f"{horas}:{minutos:02d}:{resto:02d}"
 
-    return f"{minutos}:{segundos_restantes:02d}"
+    return f"{minutos}:{resto:02d}"
 
 
 # =========================================================
@@ -479,10 +484,7 @@ def salvar_strava_auth(token_data):
         )
     else:
         dados["id"] = 1
-        supabase_insert(
-            "strava_auth",
-            dados,
-        )
+        supabase_insert("strava_auth", dados)
 
 
 def oauth_state():
@@ -703,26 +705,564 @@ def importar_atividades_strava():
         importadas += 1
         ids_existentes.add(activity_id)
 
-        # Recarrega para evitar associar duas atividades
-        # ao mesmo treino planejado.
         historico_df = carregar_historico()
 
     return importadas, ignoradas
 
 
 # =========================================================
-# CALLBACK DO STRAVA
+# COACH ADAPTATIVO
+# =========================================================
+
+def preparar_historico_coach(historico_df):
+    if historico_df.empty:
+        return historico_df.copy()
+
+    df = historico_df.copy()
+
+    df["data_plot"] = pd.to_datetime(
+        df["data"],
+        errors="coerce",
+    )
+
+    df["pace_segundos"] = df["pace"].apply(
+        pace_para_segundos
+    )
+
+    return df
+
+
+def volume_periodo(df, inicio, fim):
+    if df.empty:
+        return 0.0
+
+    mask = (
+        (df["data_dt"] >= inicio)
+        & (df["data_dt"] <= fim)
+    )
+
+    return float(
+        df.loc[mask, "distancia"].sum()
+    )
+
+
+def pace_referencia_recente(historico_df, hoje_local):
+    if historico_df.empty:
+        return 380  # 6:20/km
+
+    df = preparar_historico_coach(
+        historico_df
+    )
+
+    limite = hoje_local - timedelta(days=35)
+
+    df = df[
+        df["data_dt"] >= limite
+    ].copy()
+
+    if df.empty:
+        return 380
+
+    # Preferimos rodagens/corridas contínuas; intervalados e testes
+    # costumam distorcer o pace médio como referência de treino leve.
+    preferidos = df[
+        ~df["tipo"].isin(
+            [
+                "Intervalado",
+                "Teste 5 km",
+            ]
+        )
+    ].dropna(
+        subset=["pace_segundos"]
+    )
+
+    if preferidos.empty:
+        preferidos = df.dropna(
+            subset=["pace_segundos"]
+        )
+
+    if preferidos.empty:
+        return 380
+
+    mediana = int(
+        preferidos[
+            "pace_segundos"
+        ].median()
+    )
+
+    # Faixa plausível para uma referência recreativa
+    return max(
+        300,
+        min(
+            450,
+            mediana,
+        ),
+    )
+
+
+def analisar_estado_coach(
+    historico_df,
+    hoje_local,
+):
+    semana_atual_inicio = (
+        hoje_local
+        - timedelta(
+            days=hoje_local.weekday()
+        )
+    )
+
+    semana_anterior_inicio = (
+        semana_atual_inicio
+        - timedelta(days=7)
+    )
+
+    semana_anterior_fim = (
+        semana_atual_inicio
+        - timedelta(days=1)
+    )
+
+    volume_semana_anterior = (
+        volume_periodo(
+            historico_df,
+            semana_anterior_inicio,
+            semana_anterior_fim,
+        )
+    )
+
+    ultimos_7_inicio = (
+        hoje_local
+        - timedelta(days=6)
+    )
+
+    volume_ultimos_7 = volume_periodo(
+        historico_df,
+        ultimos_7_inicio,
+        hoje_local,
+    )
+
+    ultimos_28_inicio = (
+        hoje_local
+        - timedelta(days=27)
+    )
+
+    volume_28 = volume_periodo(
+        historico_df,
+        ultimos_28_inicio,
+        hoje_local,
+    )
+
+    treinos_28 = 0
+
+    if not historico_df.empty:
+        treinos_28 = len(
+            historico_df[
+                historico_df["data_dt"]
+                >= ultimos_28_inicio
+            ]
+        )
+
+    # Base principal: última semana completa.
+    # Se ainda não houver uma semana completa registrada,
+    # usa os últimos 7 dias.
+    volume_base = (
+        volume_semana_anterior
+        if volume_semana_anterior > 0
+        else volume_ultimos_7
+    )
+
+    if volume_base <= 0 and volume_28 > 0:
+        semanas_ativas_estimadas = max(
+            1,
+            min(
+                4,
+                round(
+                    treinos_28 / 3
+                ),
+            ),
+        )
+
+        volume_base = (
+            volume_28
+            / semanas_ativas_estimadas
+        )
+
+    if volume_base <= 0:
+        volume_base = 18.0
+
+    pace_ref = pace_referencia_recente(
+        historico_df,
+        hoje_local,
+    )
+
+    return {
+        "volume_semana_anterior": volume_semana_anterior,
+        "volume_ultimos_7": volume_ultimos_7,
+        "volume_28": volume_28,
+        "treinos_28": treinos_28,
+        "volume_base": float(volume_base),
+        "pace_ref": int(pace_ref),
+    }
+
+
+def arredondar_meio_km(valor):
+    return round(
+        float(valor) * 2
+    ) / 2
+
+
+def distribuir_distancias(
+    volume_alvo,
+    n_treinos,
+):
+    if n_treinos == 3:
+        pesos = [
+            0.28,
+            0.28,
+            0.44,
+        ]
+    elif n_treinos == 4:
+        pesos = [
+            0.23,
+            0.24,
+            0.22,
+            0.31,
+        ]
+    else:
+        pesos = [
+            0.18,
+            0.20,
+            0.16,
+            0.18,
+            0.28,
+        ]
+
+    distancias = [
+        max(
+            3.5,
+            arredondar_meio_km(
+                volume_alvo * peso
+            ),
+        )
+        for peso in pesos
+    ]
+
+    diferenca = (
+        arredondar_meio_km(volume_alvo)
+        - sum(distancias)
+    )
+
+    distancias[-1] = max(
+        4.0,
+        arredondar_meio_km(
+            distancias[-1]
+            + diferenca
+        ),
+    )
+
+    return distancias
+
+
+def montar_tipos_sessoes(
+    n_treinos,
+    fadiga,
+):
+    if n_treinos == 3:
+        tipos = [
+            "Rodagem leve",
+            "Intervalado",
+            "Longão",
+        ]
+    elif n_treinos == 4:
+        tipos = [
+            "Rodagem leve",
+            "Progressivo",
+            "Intervalado",
+            "Longão",
+        ]
+    else:
+        tipos = [
+            "Rodagem leve",
+            "Intervalado",
+            "Rodagem leve",
+            "Progressivo",
+            "Longão",
+        ]
+
+    # Se a percepção de cansaço estiver alta,
+    # trocamos uma sessão de qualidade por leve.
+    if fadiga >= 8:
+        tipos = [
+            (
+                "Rodagem leve"
+                if tipo in {
+                    "Intervalado",
+                    "Progressivo",
+                }
+                else tipo
+            )
+            for tipo in tipos
+        ]
+
+    return tipos
+
+
+def gerar_plano_coach(
+    historico_df,
+    hoje_local,
+    n_treinos,
+    dias_escolhidos,
+    intensidade_semana,
+    fadiga,
+):
+    estado = analisar_estado_coach(
+        historico_df,
+        hoje_local,
+    )
+
+    base = estado["volume_base"]
+
+    multiplicadores = {
+        "Leve": 0.85,
+        "Normal": 1.03,
+        "Progressiva": 1.07,
+    }
+
+    volume_alvo = (
+        base
+        * multiplicadores[
+            intensidade_semana
+        ]
+    )
+
+    if fadiga >= 8:
+        volume_alvo *= 0.80
+    elif fadiga >= 6:
+        volume_alvo *= 0.90
+
+    # Cap de crescimento: no máximo +8% e no máximo +3 km
+    if volume_alvo > base:
+        volume_alvo = min(
+            volume_alvo,
+            base * 1.08,
+            base + 3.0,
+        )
+
+    # Piso apenas para evitar uma semana irrealisticamente curta
+    # quando o histórico ainda é pequeno.
+    volume_alvo = max(
+        12.0,
+        volume_alvo,
+    )
+
+    volume_alvo = arredondar_meio_km(
+        volume_alvo
+    )
+
+    distancias = distribuir_distancias(
+        volume_alvo,
+        n_treinos,
+    )
+
+    tipos = montar_tipos_sessoes(
+        n_treinos,
+        fadiga,
+    )
+
+    pace_ref = estado["pace_ref"]
+
+    easy_min = pace_ref - 10
+    easy_max = pace_ref + 20
+
+    easy_min = max(
+        330,
+        easy_min,
+    )
+
+    easy_max = min(
+        450,
+        easy_max,
+    )
+
+    progressivo_inicio = easy_max
+    progressivo_fim = max(
+        320,
+        pace_ref - 25,
+    )
+
+    # Meta sub-25: 5:00/km. Em 400 m, um alvo ligeiramente
+    # mais rápido que o pace de prova é coerente, sem exagerar.
+    intervalo_rapido = 4 * 60 + 45
+    intervalo_lento = 4 * 60 + 58
+
+    proxima_segunda = (
+        hoje_local
+        + timedelta(
+            days=(
+                7
+                - hoje_local.weekday()
+            )
+        )
+    )
+
+    offsets = {
+        "Seg": 0,
+        "Ter": 1,
+        "Qua": 2,
+        "Qui": 3,
+        "Sex": 4,
+        "Sáb": 5,
+        "Dom": 6,
+    }
+
+    datas = [
+        proxima_segunda
+        + timedelta(
+            days=offsets[dia]
+        )
+        for dia in dias_escolhidos
+    ]
+
+    datas = sorted(datas)
+
+    plano = []
+
+    for i, (
+        data_treino,
+        tipo,
+        distancia,
+    ) in enumerate(
+        zip(
+            datas,
+            tipos,
+            distancias,
+        )
+    ):
+        if tipo == "Rodagem leve":
+            pace_alvo = (
+                f"{segundos_para_pace(easy_min)}"
+                f"–"
+                f"{segundos_para_pace(easy_max)}/km"
+            )
+
+            descricao = (
+                "Corrida confortável, conversa possível. "
+                "O objetivo é acumular volume sem transformar "
+                "a rodagem em treino forte."
+            )
+
+        elif tipo == "Progressivo":
+            pace_alvo = (
+                f"{segundos_para_pace(progressivo_inicio)}"
+                f" → "
+                f"{segundos_para_pace(progressivo_fim)}/km"
+            )
+
+            descricao = (
+                "Comece controlado e acelere gradualmente. "
+                "A parte final deve ser firme, mas sem sprint."
+            )
+
+        elif tipo == "Intervalado":
+            pace_alvo = (
+                f"{segundos_para_pace(intervalo_rapido)}"
+                f"–"
+                f"{segundos_para_pace(intervalo_lento)}/km"
+            )
+
+            reps = 6
+
+            if estado["treinos_28"] >= 14 and fadiga <= 4:
+                reps = 7
+
+            descricao = (
+                f"1 km leve + {reps} × 400 m no pace-alvo, "
+                "com 1 min caminhando ou trotando entre as repetições, "
+                "e 1 km leve para finalizar."
+            )
+
+        else:  # Longão
+            pace_alvo = (
+                f"{segundos_para_pace(easy_min + 5)}"
+                f"–"
+                f"{segundos_para_pace(easy_max + 10)}/km"
+            )
+
+            descricao = (
+                "Rodagem longa confortável. "
+                "Priorize constância e termine com sensação "
+                "de que ainda conseguiria correr mais alguns minutos."
+            )
+
+        plano.append(
+            {
+                "data": data_treino,
+                "tipo": tipo,
+                "distancia": float(distancia),
+                "pace_alvo": pace_alvo,
+                "descricao": descricao,
+            }
+        )
+
+    return plano, estado, volume_alvo
+
+
+def salvar_plano_coach(
+    plano,
+    planejamento_df,
+):
+    datas_existentes = set()
+
+    if not planejamento_df.empty:
+        datas_existentes = set(
+            planejamento_df["data"].astype(str)
+        )
+
+    salvos = 0
+    pulados = 0
+
+    for treino in plano:
+        data_texto = str(
+            treino["data"]
+        )
+
+        if data_texto in datas_existentes:
+            pulados += 1
+            continue
+
+        salvar_planejamento(
+            treino["data"],
+            treino["tipo"],
+            treino["distancia"],
+            treino["pace_alvo"],
+            treino["descricao"],
+        )
+
+        salvos += 1
+        datas_existentes.add(
+            data_texto
+        )
+
+    return salvos, pulados
+
+
+# =========================================================
+# CALLBACK STRAVA
 # =========================================================
 
 query = st.query_params
 
 if query.get("error") == "access_denied":
-    st.error("A autorização do Strava foi cancelada.")
+    st.error(
+        "A autorização do Strava foi cancelada."
+    )
     st.query_params.clear()
 
 elif query.get("code"):
     codigo = query.get("code")
-    state_recebido = query.get("state", "")
+    state_recebido = query.get(
+        "state",
+        "",
+    )
 
     if not hmac.compare_digest(
         str(state_recebido),
@@ -737,31 +1277,46 @@ elif query.get("code"):
                 codigo
             )
 
-            salvar_strava_auth(token_data)
+            salvar_strava_auth(
+                token_data
+            )
 
             st.query_params.clear()
-            st.session_state["mensagem"] = (
+
+            st.session_state[
+                "mensagem"
+            ] = (
                 "Strava conectado com sucesso."
             )
+
             st.rerun()
 
         except Exception as erro:
             st.error(
-                f"Não foi possível conectar ao Strava: {erro}"
+                "Não foi possível conectar ao Strava: "
+                f"{erro}"
             )
 
 
 # =========================================================
-# CONSTANTES E DATAS
+# DATAS / CONSTANTES
 # =========================================================
 
-hoje = date.today()
+FUSO = ZoneInfo(
+    "America/Sao_Paulo"
+)
+
+hoje = datetime.now(
+    FUSO
+).date()
 
 inicio_semana = hoje - timedelta(
     days=hoje.weekday()
 )
 
-fim_semana = inicio_semana + timedelta(days=6)
+fim_semana = inicio_semana + timedelta(
+    days=6
+)
 
 dias_completos = {
     0: "Segunda-feira",
@@ -795,16 +1350,19 @@ tipos_treino = [
 
 META_5K_SEG = 25 * 60
 RECORDE_5K_SEG = 24 * 60 + 20
-PACE_RECORDE_5K = RECORDE_5K_SEG / 5
+PACE_RECORDE_5K = (
+    RECORDE_5K_SEG / 5
+)
 
 
 # =========================================================
-# CARREGAMENTO DOS DADOS
+# CARREGAMENTO
 # =========================================================
 
 try:
     planejamento = carregar_planejamento()
     historico = carregar_historico()
+
 except Exception as erro:
     st.error(
         "Não foi possível acessar o Supabase. "
@@ -815,18 +1373,34 @@ except Exception as erro:
 
 if not planejamento.empty:
     semana_planejada = planejamento[
-        (planejamento["data_dt"] >= inicio_semana)
-        & (planejamento["data_dt"] <= fim_semana)
+        (
+            planejamento["data_dt"]
+            >= inicio_semana
+        )
+        &
+        (
+            planejamento["data_dt"]
+            <= fim_semana
+        )
     ].copy()
+
 else:
     semana_planejada = pd.DataFrame()
 
 
 if not historico.empty:
     semana_realizada = historico[
-        (historico["data_dt"] >= inicio_semana)
-        & (historico["data_dt"] <= fim_semana)
+        (
+            historico["data_dt"]
+            >= inicio_semana
+        )
+        &
+        (
+            historico["data_dt"]
+            <= fim_semana
+        )
     ].copy()
+
 else:
     semana_realizada = pd.DataFrame()
 
@@ -836,7 +1410,9 @@ else:
 # =========================================================
 
 st.title("🏃 Running")
-st.caption("Treino, evolução e consistência.")
+st.caption(
+    "Treino, evolução e consistência."
+)
 
 mensagem = st.session_state.pop(
     "mensagem",
@@ -844,7 +1420,9 @@ mensagem = st.session_state.pop(
 )
 
 if mensagem:
-    st.success(mensagem)
+    st.success(
+        mensagem
+    )
 
 
 # =========================================================
@@ -854,6 +1432,7 @@ if mensagem:
 with st.container(border=True):
     try:
         auth_strava = carregar_strava_auth()
+
     except Exception as erro:
         auth_strava = None
         st.error(
@@ -861,9 +1440,14 @@ with st.container(border=True):
         )
 
     if auth_strava:
-        c1, c2 = st.columns([2, 1])
+        c1, c2 = st.columns(
+            [2, 1]
+        )
 
-        c1.markdown("### Strava conectado")
+        c1.markdown(
+            "### Strava conectado"
+        )
+
         c1.caption(
             "Importe novas corridas e marque "
             "treinos planejados automaticamente."
@@ -878,7 +1462,9 @@ with st.container(border=True):
                     importar_atividades_strava()
                 )
 
-                st.session_state["mensagem"] = (
+                st.session_state[
+                    "mensagem"
+                ] = (
                     f"Sincronização concluída: "
                     f"{importadas} nova(s) corrida(s) "
                     f"importada(s)."
@@ -888,11 +1474,15 @@ with st.container(border=True):
 
             except Exception as erro:
                 st.error(
-                    f"Erro ao sincronizar Strava: {erro}"
+                    "Erro ao sincronizar Strava: "
+                    f"{erro}"
                 )
 
     else:
-        st.markdown("### Conectar Strava")
+        st.markdown(
+            "### Conectar Strava"
+        )
+
         st.caption(
             "Autorize o Running a ler suas atividades."
         )
@@ -914,6 +1504,7 @@ with st.container(border=True):
     planejar_tab,
     historico_tab,
     evolucao_tab,
+    coach_tab,
 ) = st.tabs(
     [
         "Hoje",
@@ -921,6 +1512,7 @@ with st.container(border=True):
         "Planejar",
         "Histórico",
         "Evolução",
+        "Coach",
     ]
 )
 
@@ -934,7 +1526,9 @@ with hoje_tab:
 
     with st.container(border=True):
         st.caption(
-            dias_completos[hoje.weekday()].upper()
+            dias_completos[
+                hoje.weekday()
+            ].upper()
         )
 
         st.markdown(
@@ -942,38 +1536,53 @@ with hoje_tab:
         )
 
         if not semana_planejada.empty:
-            treino_hoje_df = semana_planejada[
-                semana_planejada["data_dt"] == hoje
-            ]
+            treino_hoje_df = (
+                semana_planejada[
+                    semana_planejada[
+                        "data_dt"
+                    ]
+                    == hoje
+                ]
+            )
+
         else:
             treino_hoje_df = pd.DataFrame()
 
         if treino_hoje_df.empty:
-            st.write("Dia sem treino planejado.")
+            st.write(
+                "Dia sem treino planejado."
+            )
+
         else:
             pendentes = 0
 
-            for _, treino in treino_hoje_df.iterrows():
-                if (
+            for _, treino in (
+                treino_hoje_df.iterrows()
+            ):
+                realizado = (
                     realizado_do_planejado(
                         treino,
                         historico,
                     )
-                    is None
-                ):
+                )
+
+                if realizado is None:
                     pendentes += 1
 
             if pendentes == 0:
                 st.success(
                     "Treino de hoje concluído."
                 )
+
             else:
                 st.write(
                     "Você tem treino planejado para hoje."
                 )
 
     st.write("")
-    st.subheader("Treino de hoje")
+    st.subheader(
+        "Treino de hoje"
+    )
 
     if treino_hoje_df.empty:
         st.info(
@@ -981,14 +1590,22 @@ with hoje_tab:
         )
 
     else:
-        for _, treino in treino_hoje_df.iterrows():
-            realizado = realizado_do_planejado(
-                treino,
-                historico,
+        for _, treino in (
+            treino_hoje_df.iterrows()
+        ):
+            realizado = (
+                realizado_do_planejado(
+                    treino,
+                    historico,
+                )
             )
 
-            with st.container(border=True):
-                topo1, topo2 = st.columns([3, 1])
+            with st.container(
+                border=True
+            ):
+                topo1, topo2 = (
+                    st.columns([3, 1])
+                )
 
                 topo1.markdown(
                     f"### {treino['tipo']}"
@@ -1006,7 +1623,9 @@ with hoje_tab:
                     "Planejado",
                     (
                         f"{treino['distancia']:.1f} km"
-                        if treino["distancia"] > 0
+                        if treino[
+                            "distancia"
+                        ] > 0
                         else "-"
                     ),
                 )
@@ -1014,21 +1633,31 @@ with hoje_tab:
                 c2.metric(
                     "Pace alvo",
                     (
-                        treino["pace_alvo"]
-                        if treino["pace_alvo"]
+                        treino[
+                            "pace_alvo"
+                        ]
+                        if treino[
+                            "pace_alvo"
+                        ]
                         else "-"
                     ),
                 )
 
-                if treino["descricao"]:
+                if treino[
+                    "descricao"
+                ]:
                     st.caption(
-                        treino["descricao"]
+                        treino[
+                            "descricao"
+                        ]
                     )
 
                 if realizado is not None:
                     st.divider()
 
-                    r1, r2, r3 = st.columns(3)
+                    r1, r2, r3 = (
+                        st.columns(3)
+                    )
 
                     r1.metric(
                         "Realizado",
@@ -1038,8 +1667,12 @@ with hoje_tab:
                     r2.metric(
                         "Pace real",
                         (
-                            realizado["pace"]
-                            if realizado["pace"]
+                            realizado[
+                                "pace"
+                            ]
+                            if realizado[
+                                "pace"
+                            ]
                             else "-"
                         ),
                     )
@@ -1048,7 +1681,9 @@ with hoje_tab:
                         "Origem",
                         (
                             "Strava"
-                            if realizado.get("origem")
+                            if realizado.get(
+                                "origem"
+                            )
                             == "strava"
                             else "Manual"
                         ),
@@ -1061,57 +1696,73 @@ with hoje_tab:
                         with st.form(
                             f"concluir_{int(treino['id'])}"
                         ):
-                            distancia_real = st.number_input(
-                                "Distância realizada (km)",
-                                min_value=0.0,
-                                value=float(
-                                    treino["distancia"]
-                                ),
-                                step=0.1,
-                                key=(
-                                    f"dist_real_"
-                                    f"{int(treino['id'])}"
-                                ),
+                            distancia_real = (
+                                st.number_input(
+                                    "Distância realizada (km)",
+                                    min_value=0.0,
+                                    value=float(
+                                        treino[
+                                            "distancia"
+                                        ]
+                                    ),
+                                    step=0.1,
+                                    key=(
+                                        f"dist_real_"
+                                        f"{int(treino['id'])}"
+                                    ),
+                                )
                             )
 
-                            pace_real = st.text_input(
-                                "Pace médio",
-                                placeholder="Ex.: 6:15",
-                                key=(
-                                    f"pace_real_"
-                                    f"{int(treino['id'])}"
-                                ),
+                            pace_real = (
+                                st.text_input(
+                                    "Pace médio",
+                                    placeholder="Ex.: 6:15",
+                                    key=(
+                                        f"pace_real_"
+                                        f"{int(treino['id'])}"
+                                    ),
+                                )
                             )
 
-                            esforco_real = st.slider(
-                                "Esforço percebido",
-                                min_value=1,
-                                max_value=10,
-                                value=5,
-                                key=(
-                                    f"esf_real_"
-                                    f"{int(treino['id'])}"
-                                ),
+                            esforco_real = (
+                                st.slider(
+                                    "Esforço percebido",
+                                    min_value=1,
+                                    max_value=10,
+                                    value=5,
+                                    key=(
+                                        f"esf_real_"
+                                        f"{int(treino['id'])}"
+                                    ),
+                                )
                             )
 
-                            obs_real = st.text_area(
-                                "Observações",
-                                key=(
-                                    f"obs_real_"
-                                    f"{int(treino['id'])}"
-                                ),
+                            obs_real = (
+                                st.text_area(
+                                    "Observações",
+                                    key=(
+                                        f"obs_real_"
+                                        f"{int(treino['id'])}"
+                                    ),
+                                )
                             )
 
-                            concluir = st.form_submit_button(
-                                "Salvar como concluído",
-                                width="stretch",
+                            concluir = (
+                                st.form_submit_button(
+                                    "Salvar como concluído",
+                                    width="stretch",
+                                )
                             )
 
                             if concluir:
-                                if distancia_real <= 0:
+                                if (
+                                    distancia_real
+                                    <= 0
+                                ):
                                     st.warning(
                                         "Informe a distância."
                                     )
+
                                 elif (
                                     pace_real
                                     and pace_para_segundos(
@@ -1122,15 +1773,24 @@ with hoje_tab:
                                     st.warning(
                                         "Use o formato min:seg. Ex.: 6:15"
                                     )
+
                                 else:
                                     salvar_treino(
-                                        treino["data"],
-                                        treino["tipo"],
+                                        treino[
+                                            "data"
+                                        ],
+                                        treino[
+                                            "tipo"
+                                        ],
                                         distancia_real,
                                         pace_real,
                                         esforco_real,
                                         obs_real,
-                                        int(treino["id"]),
+                                        int(
+                                            treino[
+                                                "id"
+                                            ]
+                                        ),
                                     )
 
                                     st.rerun()
@@ -1140,7 +1800,9 @@ with hoje_tab:
     with st.expander(
         "Registrar treino extra"
     ):
-        with st.form("treino_extra"):
+        with st.form(
+            "treino_extra"
+        ):
             data_extra = st.date_input(
                 "Data",
                 value=hoje,
@@ -1152,35 +1814,45 @@ with hoje_tab:
                 key="tipo_extra",
             )
 
-            distancia_extra = st.number_input(
-                "Distância (km)",
-                min_value=0.0,
-                step=0.1,
-                key="dist_extra",
+            distancia_extra = (
+                st.number_input(
+                    "Distância (km)",
+                    min_value=0.0,
+                    step=0.1,
+                    key="dist_extra",
+                )
             )
 
-            pace_extra = st.text_input(
-                "Pace médio",
-                placeholder="Ex.: 6:15",
-                key="pace_extra",
+            pace_extra = (
+                st.text_input(
+                    "Pace médio",
+                    placeholder="Ex.: 6:15",
+                    key="pace_extra",
+                )
             )
 
-            esforco_extra = st.slider(
-                "Esforço",
-                1,
-                10,
-                5,
-                key="esforco_extra",
+            esforco_extra = (
+                st.slider(
+                    "Esforço",
+                    1,
+                    10,
+                    5,
+                    key="esforco_extra",
+                )
             )
 
-            obs_extra = st.text_area(
-                "Observações",
-                key="obs_extra",
+            obs_extra = (
+                st.text_area(
+                    "Observações",
+                    key="obs_extra",
+                )
             )
 
-            salvar_extra = st.form_submit_button(
-                "Salvar treino extra",
-                width="stretch",
+            salvar_extra = (
+                st.form_submit_button(
+                    "Salvar treino extra",
+                    width="stretch",
+                )
             )
 
             if salvar_extra:
@@ -1188,6 +1860,7 @@ with hoje_tab:
                     st.warning(
                         "Informe a distância."
                     )
+
                 elif (
                     pace_extra
                     and pace_para_segundos(
@@ -1198,6 +1871,7 @@ with hoje_tab:
                     st.warning(
                         "Use o formato min:seg. Ex.: 6:15"
                     )
+
                 else:
                     salvar_treino(
                         data_extra,
@@ -1216,11 +1890,14 @@ with hoje_tab:
 # =========================================================
 
 with semana_tab:
-    st.subheader("Sua semana")
+    st.subheader(
+        "Sua semana"
+    )
 
     st.caption(
         f"{inicio_semana.strftime('%d/%m')} "
-        f"até {fim_semana.strftime('%d/%m')}"
+        f"até "
+        f"{fim_semana.strftime('%d/%m')}"
     )
 
     total_planejados = len(
@@ -1230,7 +1907,9 @@ with semana_tab:
     concluidos = 0
 
     if not semana_planejada.empty:
-        for _, treino in semana_planejada.iterrows():
+        for _, treino in (
+            semana_planejada.iterrows()
+        ):
             if (
                 realizado_do_planejado(
                     treino,
@@ -1241,13 +1920,17 @@ with semana_tab:
                 concluidos += 1
 
     km_planejados = (
-        semana_planejada["distancia"].sum()
+        semana_planejada[
+            "distancia"
+        ].sum()
         if not semana_planejada.empty
         else 0
     )
 
     km_realizados = (
-        semana_realizada["distancia"].sum()
+        semana_realizada[
+            "distancia"
+        ].sum()
         if not semana_realizada.empty
         else 0
     )
@@ -1271,10 +1954,13 @@ with semana_tab:
 
     if total_planejados > 0:
         progresso = (
-            concluidos / total_planejados
+            concluidos
+            / total_planejados
         )
 
-        st.progress(progresso)
+        st.progress(
+            progresso
+        )
 
         st.caption(
             f"{progresso * 100:.0f}% "
@@ -1287,21 +1973,33 @@ with semana_tab:
         st.info(
             "Nenhum treino planejado nesta semana."
         )
-    else:
-        for _, treino in semana_planejada.iterrows():
-            data_treino = treino["data_dt"]
 
-            realizado = realizado_do_planejado(
-                treino,
-                historico,
+    else:
+        for _, treino in (
+            semana_planejada.iterrows()
+        ):
+            data_treino = treino[
+                "data_dt"
+            ]
+
+            realizado = (
+                realizado_do_planejado(
+                    treino,
+                    historico,
+                )
             )
 
-            with st.container(border=True):
-                topo1, topo2 = st.columns([3, 1])
+            with st.container(
+                border=True
+            ):
+                topo1, topo2 = (
+                    st.columns([3, 1])
+                )
 
                 topo1.caption(
                     f"{dias_curtos[data_treino.weekday()]} "
-                    f"· {data_treino.strftime('%d/%m')}"
+                    f"· "
+                    f"{data_treino.strftime('%d/%m')}"
                 )
 
                 topo1.markdown(
@@ -1314,13 +2012,17 @@ with semana_tab:
                     else "○ Pendente"
                 )
 
-                p1, p2 = st.columns(2)
+                p1, p2 = (
+                    st.columns(2)
+                )
 
                 p1.metric(
                     "Planejado",
                     (
                         f"{treino['distancia']:.1f} km"
-                        if treino["distancia"] > 0
+                        if treino[
+                            "distancia"
+                        ] > 0
                         else "-"
                     ),
                 )
@@ -1328,8 +2030,12 @@ with semana_tab:
                 p2.metric(
                     "Pace alvo",
                     (
-                        treino["pace_alvo"]
-                        if treino["pace_alvo"]
+                        treino[
+                            "pace_alvo"
+                        ]
+                        if treino[
+                            "pace_alvo"
+                        ]
                         else "-"
                     ),
                 )
@@ -1337,7 +2043,9 @@ with semana_tab:
                 if realizado is not None:
                     st.divider()
 
-                    r1, r2, r3 = st.columns(3)
+                    r1, r2, r3 = (
+                        st.columns(3)
+                    )
 
                     r1.metric(
                         "Real",
@@ -1347,8 +2055,12 @@ with semana_tab:
                     r2.metric(
                         "Pace",
                         (
-                            realizado["pace"]
-                            if realizado["pace"]
+                            realizado[
+                                "pace"
+                            ]
+                            if realizado[
+                                "pace"
+                            ]
                             else "-"
                         ),
                     )
@@ -1357,7 +2069,9 @@ with semana_tab:
                         "Origem",
                         (
                             "Strava"
-                            if realizado.get("origem")
+                            if realizado.get(
+                                "origem"
+                            )
                             == "strava"
                             else "Manual"
                         ),
@@ -1369,45 +2083,61 @@ with semana_tab:
 # =========================================================
 
 with planejar_tab:
-    st.subheader("Novo treino")
+    st.subheader(
+        "Novo treino"
+    )
 
     with st.form(
         "planejamento_form",
         clear_on_submit=True,
     ):
-        data_planejada = st.date_input(
-            "Data",
-            value=hoje,
+        data_planejada = (
+            st.date_input(
+                "Data",
+                value=hoje,
+            )
         )
 
-        tipo_planejado = st.selectbox(
-            "Tipo",
-            tipos_treino,
-            key="tipo_planejado",
+        tipo_planejado = (
+            st.selectbox(
+                "Tipo",
+                tipos_treino,
+                key="tipo_planejado",
+            )
         )
 
-        distancia_planejada = st.number_input(
-            "Distância prevista (km)",
-            min_value=0.0,
-            step=0.1,
+        distancia_planejada = (
+            st.number_input(
+                "Distância prevista (km)",
+                min_value=0.0,
+                step=0.1,
+            )
         )
 
-        pace_planejado = st.text_input(
-            "Pace alvo",
-            placeholder="Ex.: 6:20, 4:55 ou Livre",
+        pace_planejado = (
+            st.text_input(
+                "Pace alvo",
+                placeholder=(
+                    "Ex.: 6:20, 4:55 ou Livre"
+                ),
+            )
         )
 
-        descricao_planejada = st.text_area(
-            "Orientações",
-            placeholder=(
-                "Ex.: 1 km leve + 6 x 400 m "
-                "+ 1 km leve."
-            ),
+        descricao_planejada = (
+            st.text_area(
+                "Orientações",
+                placeholder=(
+                    "Ex.: 1 km leve + 6 x 400 m "
+                    "+ 1 km leve."
+                ),
+            )
         )
 
-        adicionar = st.form_submit_button(
-            "Adicionar treino",
-            width="stretch",
+        adicionar = (
+            st.form_submit_button(
+                "Adicionar treino",
+                width="stretch",
+            )
         )
 
         if adicionar:
@@ -1422,11 +2152,17 @@ with planejar_tab:
             st.rerun()
 
     st.divider()
-    st.subheader("Próximos treinos")
+
+    st.subheader(
+        "Próximos treinos"
+    )
 
     futuros = (
         planejamento[
-            planejamento["data_dt"] >= hoje
+            planejamento[
+                "data_dt"
+            ]
+            >= hoje
         ]
         if not planejamento.empty
         else pd.DataFrame()
@@ -1436,16 +2172,25 @@ with planejar_tab:
         st.info(
             "Nenhum treino futuro."
         )
+
     else:
-        for _, treino in futuros.iterrows():
-            realizado = realizado_do_planejado(
-                treino,
-                historico,
+        for _, treino in (
+            futuros.iterrows()
+        ):
+            realizado = (
+                realizado_do_planejado(
+                    treino,
+                    historico,
+                )
             )
 
-            with st.container(border=True):
+            with st.container(
+                border=True
+            ):
                 st.caption(
-                    treino["data_dt"].strftime(
+                    treino[
+                        "data_dt"
+                    ].strftime(
                         "%d/%m/%Y"
                     )
                 )
@@ -1457,19 +2202,27 @@ with planejar_tab:
                 st.write(
                     (
                         f"📏 {treino['distancia']:.1f} km"
-                        if treino["distancia"] > 0
+                        if treino[
+                            "distancia"
+                        ] > 0
                         else "📏 Distância livre"
                     )
                 )
 
-                if treino["pace_alvo"]:
+                if treino[
+                    "pace_alvo"
+                ]:
                     st.write(
                         f"🎯 {treino['pace_alvo']}"
                     )
 
-                if treino["descricao"]:
+                if treino[
+                    "descricao"
+                ]:
                     st.caption(
-                        treino["descricao"]
+                        treino[
+                            "descricao"
+                        ]
                     )
 
                 if realizado is None:
@@ -1484,7 +2237,9 @@ with planejar_tab:
                         excluir_planejamento(
                             treino["id"]
                         )
+
                         st.rerun()
+
                 else:
                     st.success(
                         "Treino concluído."
@@ -1496,19 +2251,30 @@ with planejar_tab:
 # =========================================================
 
 with historico_tab:
-    st.subheader("Histórico")
+    st.subheader(
+        "Histórico"
+    )
 
     if historico.empty:
         st.info(
             "Nenhum treino registrado."
         )
+
     else:
-        for _, treino in historico.iterrows():
-            with st.container(border=True):
-                c1, c2 = st.columns([4, 1])
+        for _, treino in (
+            historico.iterrows()
+        ):
+            with st.container(
+                border=True
+            ):
+                c1, c2 = (
+                    st.columns([4, 1])
+                )
 
                 c1.caption(
-                    treino["data_dt"].strftime(
+                    treino[
+                        "data_dt"
+                    ].strftime(
                         "%d/%m/%Y"
                     )
                 )
@@ -1528,9 +2294,12 @@ with historico_tab:
                     excluir_treino(
                         treino["id"]
                     )
+
                     st.rerun()
 
-                m1, m2, m3 = st.columns(3)
+                m1, m2, m3 = (
+                    st.columns(3)
+                )
 
                 m1.metric(
                     "Distância",
@@ -1541,7 +2310,9 @@ with historico_tab:
                     "Pace",
                     (
                         treino["pace"]
-                        if treino.get("pace")
+                        if treino.get(
+                            "pace"
+                        )
                         else "-"
                     ),
                 )
@@ -1550,7 +2321,9 @@ with historico_tab:
                     "Origem",
                     (
                         "Strava"
-                        if treino.get("origem")
+                        if treino.get(
+                            "origem"
+                        )
                         == "strava"
                         else "Manual"
                     ),
@@ -1558,45 +2331,67 @@ with historico_tab:
 
                 detalhes = []
 
-                duracao = treino.get("duracao_seg")
-                elevacao = treino.get("elevacao_m")
+                duracao = treino.get(
+                    "duracao_seg"
+                )
+
+                elevacao = treino.get(
+                    "elevacao_m"
+                )
+
                 fc_media = treino.get(
                     "frequencia_cardiaca_media"
                 )
 
                 if (
                     duracao is not None
-                    and not pd.isna(duracao)
+                    and not pd.isna(
+                        duracao
+                    )
                 ):
                     detalhes.append(
                         "Tempo: "
-                        + segundos_para_tempo(duracao)
+                        + segundos_para_tempo(
+                            duracao
+                        )
                     )
 
                 if (
                     elevacao is not None
-                    and not pd.isna(elevacao)
+                    and not pd.isna(
+                        elevacao
+                    )
                 ):
                     detalhes.append(
-                        f"Elevação: {float(elevacao):.0f} m"
+                        f"Elevação: "
+                        f"{float(elevacao):.0f} m"
                     )
 
                 if (
                     fc_media is not None
-                    and not pd.isna(fc_media)
+                    and not pd.isna(
+                        fc_media
+                    )
                 ):
                     detalhes.append(
-                        f"FC média: {float(fc_media):.0f} bpm"
+                        f"FC média: "
+                        f"{float(fc_media):.0f} bpm"
                     )
 
                 if detalhes:
                     st.caption(
-                        " · ".join(detalhes)
+                        " · ".join(
+                            detalhes
+                        )
                     )
 
-                if treino.get("observacao"):
+                if treino.get(
+                    "observacao"
+                ):
                     st.caption(
-                        treino["observacao"]
+                        treino[
+                            "observacao"
+                        ]
                     )
 
 
@@ -1605,9 +2400,13 @@ with historico_tab:
 # =========================================================
 
 with evolucao_tab:
-    st.subheader("Meta 5 km")
+    st.subheader(
+        "Meta 5 km"
+    )
 
-    meta1, meta2, meta3 = st.columns(3)
+    meta1, meta2, meta3 = (
+        st.columns(3)
+    )
 
     meta1.metric(
         "Objetivo",
@@ -1636,11 +2435,19 @@ with evolucao_tab:
             "Registre ou sincronize treinos "
             "para acompanhar sua evolução."
         )
-    else:
-        total_km = historico["distancia"].sum()
-        quantidade = len(historico)
 
-        e1, e2 = st.columns(2)
+    else:
+        total_km = historico[
+            "distancia"
+        ].sum()
+
+        quantidade = len(
+            historico
+        )
+
+        e1, e2 = (
+            st.columns(2)
+        )
 
         e1.metric(
             "Treinos",
@@ -1652,42 +2459,64 @@ with evolucao_tab:
             f"{total_km:.1f}",
         )
 
-        grafico_pace = historico.copy()
-
-        grafico_pace["data_plot"] = pd.to_datetime(
-            grafico_pace["data"]
+        grafico_pace = (
+            historico.copy()
         )
 
-        grafico_pace["pace_segundos"] = (
-            grafico_pace["pace"]
-            .apply(pace_para_segundos)
+        grafico_pace[
+            "data_plot"
+        ] = pd.to_datetime(
+            grafico_pace[
+                "data"
+            ]
+        )
+
+        grafico_pace[
+            "pace_segundos"
+        ] = grafico_pace[
+            "pace"
+        ].apply(
+            pace_para_segundos
         )
 
         grafico_pace = (
             grafico_pace.dropna(
-                subset=["pace_segundos"]
+                subset=[
+                    "pace_segundos"
+                ]
             )
-            .sort_values("data_plot")
+            .sort_values(
+                "data_plot"
+            )
         )
 
         if not grafico_pace.empty:
             st.write("")
-            st.subheader("Pace por treino")
+
+            st.subheader(
+                "Pace por treino"
+            )
 
             fig = go.Figure()
 
             fig.add_trace(
                 go.Scatter(
-                    x=grafico_pace["data_plot"],
-                    y=grafico_pace["pace_segundos"],
-                    mode="lines+markers",
-                    customdata=grafico_pace[
-                        [
-                            "tipo",
-                            "distancia",
-                            "pace",
-                        ]
+                    x=grafico_pace[
+                        "data_plot"
                     ],
+                    y=grafico_pace[
+                        "pace_segundos"
+                    ],
+                    mode="lines+markers",
+                    customdata=(
+                        grafico_pace[
+                            [
+                                "tipo",
+                                "distancia",
+                                "pace",
+                            ]
+                        ]
+                    ),
                     hovertemplate=(
                         "<b>%{customdata[0]}</b>"
                         "<br>%{customdata[1]:.1f} km"
@@ -1698,22 +2527,34 @@ with evolucao_tab:
             )
 
             min_pace = int(
-                grafico_pace["pace_segundos"].min()
+                grafico_pace[
+                    "pace_segundos"
+                ].min()
             )
 
             max_pace = int(
-                grafico_pace["pace_segundos"].max()
+                grafico_pace[
+                    "pace_segundos"
+                ].max()
             )
 
             inicio = max(
                 0,
-                ((min_pace - 30) // 15) * 15,
+                (
+                    (min_pace - 30)
+                    // 15
+                )
+                * 15,
             )
 
             fim = (
-                ((max_pace + 30 + 14) // 15)
-                * 15
-            )
+                (
+                    max_pace
+                    + 30
+                    + 14
+                )
+                // 15
+            ) * 15
 
             ticks = list(
                 range(
@@ -1741,7 +2582,9 @@ with evolucao_tab:
                 tickmode="array",
                 tickvals=ticks,
                 ticktext=[
-                    segundos_para_pace(x)
+                    segundos_para_pace(
+                        x
+                    )
                     for x in ticks
                 ],
             )
@@ -1752,18 +2595,33 @@ with evolucao_tab:
             )
 
         st.divider()
-        st.subheader("Volume semanal")
 
-        volume = historico.copy()
-
-        volume["data_plot"] = pd.to_datetime(
-            volume["data"]
+        st.subheader(
+            "Volume semanal"
         )
 
-        volume["semana"] = (
-            volume["data_plot"]
+        volume = (
+            historico.copy()
+        )
+
+        volume[
+            "data_plot"
+        ] = pd.to_datetime(
+            volume[
+                "data"
+            ]
+        )
+
+        volume[
+            "semana"
+        ] = (
+            volume[
+                "data_plot"
+            ]
             - pd.to_timedelta(
-                volume["data_plot"].dt.weekday,
+                volume[
+                    "data_plot"
+                ].dt.weekday,
                 unit="D",
             )
         )
@@ -1772,37 +2630,64 @@ with evolucao_tab:
             volume.groupby(
                 "semana",
                 as_index=False,
-            )["distancia"]
+            )[
+                "distancia"
+            ]
             .sum()
-            .sort_values("semana")
+            .sort_values(
+                "semana"
+            )
         )
 
         st.bar_chart(
             volume_semanal.set_index(
                 "semana"
-            )["distancia"],
+            )[
+                "distancia"
+            ],
             width="stretch",
         )
 
-        testes = grafico_pace[
-            grafico_pace["tipo"] == "Teste 5 km"
-        ].copy()
+        testes = (
+            grafico_pace[
+                grafico_pace[
+                    "tipo"
+                ]
+                == "Teste 5 km"
+            ].copy()
+        )
 
         if not testes.empty:
-            testes["tempo_5k"] = (
-                testes["pace_segundos"] * 5
+            testes[
+                "tempo_5k"
+            ] = (
+                testes[
+                    "pace_segundos"
+                ]
+                * 5
             )
 
             melhor = testes.loc[
-                testes["tempo_5k"].idxmin()
+                testes[
+                    "tempo_5k"
+                ].idxmin()
             ]
 
-            melhor_tempo = melhor["tempo_5k"]
+            melhor_tempo = (
+                melhor[
+                    "tempo_5k"
+                ]
+            )
 
             st.divider()
-            st.subheader("Teste de 5 km")
 
-            t1, t2 = st.columns(2)
+            st.subheader(
+                "Teste de 5 km"
+            )
+
+            t1, t2 = (
+                st.columns(2)
+            )
 
             t1.metric(
                 "Melhor teste",
@@ -1812,7 +2697,8 @@ with evolucao_tab:
             )
 
             diferenca = (
-                melhor_tempo - META_5K_SEG
+                melhor_tempo
+                - META_5K_SEG
             )
 
             if diferenca > 0:
@@ -1820,8 +2706,319 @@ with evolucao_tab:
                     "Faltam",
                     f"{int(round(diferenca))} s",
                 )
+
             else:
                 t2.metric(
                     "Meta",
                     "Sub-25 ✅",
                 )
+
+
+# =========================================================
+# COACH
+# =========================================================
+
+with coach_tab:
+    st.subheader(
+        "Coach adaptativo"
+    )
+
+    st.caption(
+        "O plano usa seu histórico recente do Strava, "
+        "volume semanal, pace de referência, disponibilidade "
+        "e percepção de cansaço."
+    )
+
+    estado_coach = (
+        analisar_estado_coach(
+            historico,
+            hoje,
+        )
+    )
+
+    c1, c2, c3 = (
+        st.columns(3)
+    )
+
+    c1.metric(
+        "Base semanal",
+        f"{estado_coach['volume_base']:.1f} km",
+    )
+
+    c2.metric(
+        "Últimos 28 dias",
+        f"{estado_coach['volume_28']:.1f} km",
+    )
+
+    c3.metric(
+        "Pace referência",
+        (
+            f"{segundos_para_pace(estado_coach['pace_ref'])}/km"
+        ),
+    )
+
+    st.write("")
+
+    with st.form(
+        "coach_form"
+    ):
+        n_treinos = (
+            st.select_slider(
+                "Quantos dias você pode correr na próxima semana?",
+                options=[
+                    3,
+                    4,
+                    5,
+                ],
+                value=4,
+            )
+        )
+
+        intensidade_semana = (
+            st.radio(
+                "Tipo de semana",
+                [
+                    "Leve",
+                    "Normal",
+                    "Progressiva",
+                ],
+                horizontal=True,
+                index=1,
+            )
+        )
+
+        fadiga = (
+            st.slider(
+                "Cansaço geral hoje",
+                min_value=1,
+                max_value=10,
+                value=4,
+                help=(
+                    "1 = muito descansado; "
+                    "10 = muito cansado."
+                ),
+            )
+        )
+
+        opcoes_dias = [
+            "Seg",
+            "Ter",
+            "Qua",
+            "Qui",
+            "Sex",
+            "Sáb",
+            "Dom",
+        ]
+
+        defaults = {
+            3: [
+                "Ter",
+                "Qui",
+                "Dom",
+            ],
+            4: [
+                "Seg",
+                "Qua",
+                "Sex",
+                "Dom",
+            ],
+            5: [
+                "Seg",
+                "Ter",
+                "Qui",
+                "Sáb",
+                "Dom",
+            ],
+        }
+
+        dias_escolhidos = (
+            st.multiselect(
+                "Dias disponíveis",
+                options=opcoes_dias,
+                default=defaults[
+                    n_treinos
+                ],
+            )
+        )
+
+        gerar = (
+            st.form_submit_button(
+                "Gerar próxima semana",
+                width="stretch",
+            )
+        )
+
+        if gerar:
+            if (
+                len(
+                    dias_escolhidos
+                )
+                != n_treinos
+            ):
+                st.warning(
+                    f"Escolha exatamente "
+                    f"{n_treinos} dias."
+                )
+
+            else:
+                plano_gerado, estado_usado, volume_alvo = (
+                    gerar_plano_coach(
+                        historico,
+                        hoje,
+                        n_treinos,
+                        dias_escolhidos,
+                        intensidade_semana,
+                        fadiga,
+                    )
+                )
+
+                st.session_state[
+                    "plano_coach"
+                ] = plano_gerado
+
+                st.session_state[
+                    "coach_volume_alvo"
+                ] = volume_alvo
+
+                st.session_state[
+                    "coach_estado"
+                ] = estado_usado
+
+                st.rerun()
+
+    plano_coach = (
+        st.session_state.get(
+            "plano_coach"
+        )
+    )
+
+    if plano_coach:
+        st.divider()
+
+        st.subheader(
+            "Próxima semana sugerida"
+        )
+
+        volume_alvo = (
+            st.session_state.get(
+                "coach_volume_alvo",
+                sum(
+                    treino[
+                        "distancia"
+                    ]
+                    for treino in plano_coach
+                ),
+            )
+        )
+
+        st.metric(
+            "Volume sugerido",
+            f"{volume_alvo:.1f} km",
+        )
+
+        if fadiga >= 8:
+            st.info(
+                "Como o cansaço informado está alto, "
+                "o plano reduz volume e remove sessões fortes."
+            )
+
+        for treino in plano_coach:
+            with st.container(
+                border=True
+            ):
+                st.caption(
+                    treino[
+                        "data"
+                    ].strftime(
+                        "%A · %d/%m"
+                    )
+                )
+
+                st.markdown(
+                    f"### {treino['tipo']}"
+                )
+
+                a1, a2 = (
+                    st.columns(2)
+                )
+
+                a1.metric(
+                    "Distância",
+                    f"{treino['distancia']:.1f} km",
+                )
+
+                a2.metric(
+                    "Pace",
+                    treino[
+                        "pace_alvo"
+                    ],
+                )
+
+                st.caption(
+                    treino[
+                        "descricao"
+                    ]
+                )
+
+        st.write("")
+
+        if st.button(
+            "Aceitar e salvar plano",
+            type="primary",
+            width="stretch",
+        ):
+            try:
+                salvos, pulados = (
+                    salvar_plano_coach(
+                        plano_coach,
+                        planejamento,
+                    )
+                )
+
+                st.session_state.pop(
+                    "plano_coach",
+                    None,
+                )
+
+                texto = (
+                    f"{salvos} treino(s) "
+                    "salvo(s) na próxima semana."
+                )
+
+                if pulados:
+                    texto += (
+                        f" {pulados} data(s) "
+                        "já tinham treino e foram preservadas."
+                    )
+
+                st.session_state[
+                    "mensagem"
+                ] = texto
+
+                st.rerun()
+
+            except Exception as erro:
+                st.error(
+                    "Não foi possível salvar o plano: "
+                    f"{erro}"
+                )
+
+        if st.button(
+            "Descartar sugestão",
+            width="stretch",
+        ):
+            st.session_state.pop(
+                "plano_coach",
+                None,
+            )
+
+            st.rerun()
+
+    st.divider()
+
+    st.caption(
+        "Versão 1 do Coach: regras adaptativas e seus dados reais. "
+        "A próxima evolução pode adicionar um modelo generativo para "
+        "explicar e personalizar o plano em linguagem natural, sem "
+        "remover os limites de segurança do motor."
+    )
