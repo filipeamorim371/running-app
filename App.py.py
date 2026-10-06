@@ -4,6 +4,7 @@ import time
 from datetime import datetime, date, timedelta
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -15,9 +16,11 @@ import streamlit as st
 # CONFIGURAÇÃO
 # =========================================================
 
+LOGO_PATH = Path("logo.png")
+
 st.set_page_config(
     page_title="Running",
-    page_icon="🏃",
+    page_icon=str(LOGO_PATH) if LOGO_PATH.exists() else "🏃",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
@@ -72,6 +75,33 @@ except Exception:
 
 
 # =========================================================
+# MARCA
+# =========================================================
+
+def mostrar_marca(subtitulo=None):
+    if LOGO_PATH.exists():
+        col_logo, col_titulo = st.columns([1, 5])
+
+        with col_logo:
+            st.image(
+                str(LOGO_PATH),
+                width=72,
+            )
+
+        with col_titulo:
+            st.title("Running")
+
+            if subtitulo:
+                st.caption(subtitulo)
+
+    else:
+        st.title("🏃 Running")
+
+        if subtitulo:
+            st.caption(subtitulo)
+
+
+# =========================================================
 # LOGIN
 # =========================================================
 
@@ -79,8 +109,7 @@ def autenticar_app():
     if st.session_state.get("autenticado"):
         return
 
-    st.title("🏃 Running")
-    st.caption("Área privada")
+    mostrar_marca("Área privada")
 
     senha = st.text_input(
         "Senha",
@@ -1792,8 +1821,7 @@ else:
 # CABEÇALHO
 # =========================================================
 
-st.title("🏃 Running")
-st.caption(
+mostrar_marca(
     "Treino, evolução e consistência."
 )
 
