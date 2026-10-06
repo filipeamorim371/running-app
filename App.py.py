@@ -11,6 +11,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from supabase import create_client
+from supabase.lib.client_options import ClientOptions
 
 
 # =========================================================
@@ -241,6 +243,120 @@ def validar_token_faceid(access_token):
 
     except Exception:
         return False, None
+
+
+
+def preparar_conta_faceid_no_servidor(password):
+    """
+    Garante que exista um usuário Supabase Auth para FACEID_EMAIL,
+    confirma o e-mail e define exatamente a senha informada.
+
+    A operação roda no servidor com SUPABASE_SECRET; a secret key
+    nunca é enviada ao navegador.
+    """
+    if not faceid_configurado():
+        return False, "Face ID ainda não está configurado nos Secrets."
+
+    if not password or len(password) < 6:
+        return False, "Use uma senha com pelo menos 6 caracteres."
+
+    try:
+        admin_client = create_client(
+            SUPABASE_URL,
+            SUPABASE_SECRET,
+            options=ClientOptions(
+                auto_refresh_token=False,
+                persist_session=False,
+            ),
+        )
+
+        resposta = admin_client.auth.admin.list_users(
+            page=1,
+            per_page=1000,
+        )
+
+        if isinstance(resposta, list):
+            usuarios = resposta
+        elif isinstance(resposta, dict):
+            usuarios = resposta.get("users", [])
+        else:
+            usuarios = getattr(
+                resposta,
+                "users",
+                [],
+            )
+
+        usuario_encontrado = None
+
+        for usuario in usuarios or []:
+            if isinstance(usuario, dict):
+                email = str(
+                    usuario.get("email")
+                    or ""
+                ).strip().lower()
+
+                uid = usuario.get("id")
+            else:
+                email = str(
+                    getattr(
+                        usuario,
+                        "email",
+                        "",
+                    )
+                    or ""
+                ).strip().lower()
+
+                uid = getattr(
+                    usuario,
+                    "id",
+                    None,
+                )
+
+            if hmac.compare_digest(
+                email,
+                FACEID_EMAIL,
+            ):
+                usuario_encontrado = (
+                    uid
+                )
+                break
+
+        if usuario_encontrado:
+            admin_client.auth.admin.update_user_by_id(
+                str(
+                    usuario_encontrado
+                ),
+                {
+                    "password": password,
+                    "email_confirm": True,
+                },
+            )
+
+            return True, (
+                "Conta de segurança atualizada e confirmada."
+            )
+
+        admin_client.auth.admin.create_user(
+            {
+                "email": FACEID_EMAIL,
+                "password": password,
+                "email_confirm": True,
+            }
+        )
+
+        return True, (
+            "Conta de segurança criada e confirmada."
+        )
+
+    except Exception as erro:
+        texto = str(
+            erro
+        )
+
+        return False, (
+            "Não foi possível preparar a conta de segurança no Supabase: "
+            + texto[:500]
+        )
 
 
 PASSKEY_HTML = r"""
@@ -618,9 +734,9 @@ with st.sidebar:
             )
 
             st.info(
-                "Para cadastrar o Face ID, use a senha do usuário criado no "
-                "Supabase em Authentication → Users. Ela pode ser diferente "
-                "da senha normal do Running."
+                "Escolha a senha da conta de segurança. O Running vai criar ou "
+                "atualizar esse usuário no Supabase automaticamente e confirmar "
+                "o e-mail antes de registrar a passkey."
             )
 
             st.caption(
@@ -631,29 +747,47 @@ with st.sidebar:
                 "faceid_reg_security_password"
             ):
                 senha_seguranca = st.text_input(
-                    "Senha da conta de segurança (Supabase)",
+                    "Senha da conta de segurança",
                     type="password",
                     key="senha_conta_supabase_faceid",
                     help=(
-                        "É a senha do usuário do Supabase Auth, não necessariamente "
-                        "a senha usada para abrir o Running."
+                        "Pode ser a mesma senha do Running ou outra. "
+                        "Ela será definida no Supabase Auth pelo próprio app."
                     ),
                 )
 
                 if st.button(
-                    "Continuar para registrar Face ID",
+                    "Preparar conta e registrar Face ID",
                     width="stretch",
                     key="preparar_faceid",
                 ):
                     if senha_seguranca:
-                        st.session_state[
-                            "faceid_reg_security_password"
-                        ] = senha_seguranca
+                        with st.spinner(
+                            "Preparando a conta de segurança..."
+                        ):
+                            ok_conta, mensagem_conta = (
+                                preparar_conta_faceid_no_servidor(
+                                    senha_seguranca
+                                )
+                            )
 
-                        st.rerun()
+                        if ok_conta:
+                            st.session_state[
+                                "faceid_reg_security_password"
+                            ] = senha_seguranca
+
+                            st.session_state[
+                                "mensagem"
+                            ] = mensagem_conta
+
+                            st.rerun()
+                        else:
+                            st.error(
+                                mensagem_conta
+                            )
                     else:
                         st.warning(
-                            "Digite a senha da conta de segurança do Supabase."
+                            "Digite uma senha para a conta de segurança."
                         )
 
             else:
@@ -698,9 +832,8 @@ with st.sidebar:
                             or "conta" in erro.lower()
                         ):
                             st.caption(
-                                "Confira no Supabase → Authentication → Users se "
-                                "o e-mail acima existe, está confirmado e qual senha "
-                                "foi definida para esse usuário."
+                                "Use 'Trocar senha / tentar novamente' e deixe o app "
+                                "recriar ou atualizar a conta de segurança automaticamente."
                             )
 
                 if st.button(
