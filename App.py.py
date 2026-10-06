@@ -176,6 +176,272 @@ except Exception:
     OPENAI_MODEL = "gpt-6-luna"
 
 
+# Face ID / Passkey é opcional. O app continua aceitando a senha normal
+# se esta configuração ainda não existir.
+try:
+    SUPABASE_PUBLISHABLE_KEY = st.secrets["supabase"]["publishable_key"]
+except Exception:
+    SUPABASE_PUBLISHABLE_KEY = None
+
+try:
+    FACEID_EMAIL = st.secrets["faceid"]["email"].strip().lower()
+except Exception:
+    FACEID_EMAIL = None
+
+
+# =========================================================
+# PASSKEY / FACE ID
+# =========================================================
+
+def faceid_configurado():
+    return bool(
+        SUPABASE_PUBLISHABLE_KEY
+        and FACEID_EMAIL
+    )
+
+
+def validar_token_faceid(access_token):
+    """
+    Valida no servidor um access token emitido pelo Supabase Auth.
+    O token só libera o app se pertencer ao usuário configurado em
+    [faceid].email. O secret key nunca é enviado ao navegador.
+    """
+    if not faceid_configurado():
+        return False, None
+
+    if not access_token:
+        return False, None
+
+    try:
+        resposta = requests.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "apikey": SUPABASE_PUBLISHABLE_KEY,
+                "Authorization": f"Bearer {access_token}",
+            },
+            timeout=15,
+        )
+
+        if not resposta.ok:
+            return False, None
+
+        usuario = resposta.json()
+        email = str(
+            usuario.get("email")
+            or ""
+        ).strip().lower()
+
+        if not hmac.compare_digest(
+            email,
+            FACEID_EMAIL,
+        ):
+            return False, usuario
+
+        return True, usuario
+
+    except Exception:
+        return False, None
+
+
+PASSKEY_HTML = r"""
+<div class="passkey-box">
+  <button id="passkey-button" type="button">Face ID</button>
+  <div id="passkey-status" aria-live="polite"></div>
+</div>
+"""
+
+PASSKEY_CSS = r"""
+.passkey-box {
+  width: 100%;
+  font-family: var(--st-font);
+}
+
+#passkey-button {
+  width: 100%;
+  min-height: 46px;
+  border: 0;
+  border-radius: 12px;
+  padding: 0.65rem 1rem;
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+  color: #ffffff;
+  background: #7A263A;
+}
+
+#passkey-button:hover {
+  filter: brightness(0.94);
+}
+
+#passkey-button:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+
+#passkey-status {
+  min-height: 1.1rem;
+  margin-top: 0.45rem;
+  font-size: 0.84rem;
+  color: var(--st-secondary-text-color);
+}
+"""
+
+PASSKEY_JS = r"""
+export default function(component) {
+  const { parentElement, data, setTriggerValue } = component;
+  const button = parentElement.querySelector('#passkey-button');
+  const status = parentElement.querySelector('#passkey-status');
+
+  const action = data?.action || 'signin';
+  button.textContent = action === 'register'
+    ? 'Registrar Face ID neste iPhone'
+    : 'Entrar com Face ID';
+
+  const showError = (message) => {
+    status.textContent = message || 'Não foi possível concluir a autenticação.';
+    status.style.color = '#A61B29';
+  };
+
+  button.onclick = async () => {
+    button.disabled = true;
+    status.style.color = '';
+    status.textContent = action === 'register'
+      ? 'Preparando o Face ID…'
+      : 'Aguardando o Face ID…';
+
+    try {
+      if (!window.PublicKeyCredential) {
+        throw new Error('Este navegador não oferece suporte a passkeys/WebAuthn.');
+      }
+
+      const module = await import(
+        'https://esm.sh/@supabase/supabase-js@2.105.0'
+      );
+
+      const supabase = module.createClient(
+        data.supabase_url,
+        data.publishable_key,
+        {
+          auth: {
+            persistSession: false,
+            autoRefreshToken: false,
+            detectSessionInUrl: false,
+            experimental: { passkey: true },
+          },
+        }
+      );
+
+      if (action === 'register') {
+        const signIn = await supabase.auth.signInWithPassword({
+          email: data.email,
+          password: data.password,
+        });
+
+        if (signIn.error) {
+          throw signIn.error;
+        }
+
+        const registration = await supabase.auth.registerPasskey();
+
+        if (registration.error) {
+          throw registration.error;
+        }
+
+        setTriggerValue('auth_result', {
+          ok: true,
+          action: 'register',
+          passkey_id: registration.data?.id || null,
+          friendly_name: registration.data?.friendly_name || 'Passkey',
+        });
+
+        status.textContent = 'Face ID registrado.';
+      } else {
+        const signIn = await supabase.auth.signInWithPasskey();
+
+        if (signIn.error) {
+          throw signIn.error;
+        }
+
+        const token = signIn.data?.session?.access_token;
+
+        if (!token) {
+          throw new Error('O Supabase não retornou uma sessão válida.');
+        }
+
+        setTriggerValue('auth_result', {
+          ok: true,
+          action: 'signin',
+          access_token: token,
+        });
+
+        status.textContent = 'Autenticado.';
+      }
+    } catch (error) {
+      const raw = error?.message || String(error || 'Erro desconhecido');
+      let friendly = raw;
+
+      if (/cancel|abort|notallowed/i.test(raw)) {
+        friendly = 'Autenticação cancelada.';
+      } else if (/passkey_disabled/i.test(raw)) {
+        friendly = 'Passkeys ainda não foram ativadas no Supabase.';
+      } else if (/credential.*exists/i.test(raw)) {
+        friendly = 'Este Face ID/passkey já está registrado.';
+      } else if (/invalid login|credentials/i.test(raw)) {
+        friendly = 'Não foi possível validar a conta de segurança.';
+      }
+
+      showError(friendly);
+      setTriggerValue('auth_result', {
+        ok: false,
+        action,
+        error: friendly,
+      });
+    } finally {
+      button.disabled = false;
+    }
+  };
+}
+"""
+
+try:
+    passkey_component = st.components.v2.component(
+        name="running_passkey",
+        html=PASSKEY_HTML,
+        css=PASSKEY_CSS,
+        js=PASSKEY_JS,
+    )
+except Exception:
+    passkey_component = None
+
+
+def montar_passkey(
+    action,
+    key,
+    password=None,
+):
+    if (
+        not faceid_configurado()
+        or passkey_component is None
+    ):
+        return None
+
+    dados = {
+        "action": action,
+        "supabase_url": SUPABASE_URL,
+        "publishable_key": SUPABASE_PUBLISHABLE_KEY,
+        "email": FACEID_EMAIL,
+    }
+
+    if password is not None:
+        dados["password"] = password
+
+    return passkey_component(
+        data=dados,
+        on_auth_result_change=lambda: None,
+        key=key,
+    )
+
+
 # =========================================================
 # MARCA
 # =========================================================
@@ -213,23 +479,219 @@ def autenticar_app():
 
     mostrar_marca("Área privada")
 
+    if faceid_configurado() and passkey_component is not None:
+        st.markdown("### Acesso rápido")
+
+        resultado_faceid = montar_passkey(
+            action="signin",
+            key="faceid_login",
+        )
+
+        evento_faceid = getattr(
+            resultado_faceid,
+            "auth_result",
+            None,
+        ) if resultado_faceid is not None else None
+
+        if evento_faceid:
+            if evento_faceid.get("ok"):
+                valido, usuario = validar_token_faceid(
+                    evento_faceid.get(
+                        "access_token"
+                    )
+                )
+
+                if valido:
+                    st.session_state[
+                        "autenticado"
+                    ] = True
+
+                    st.session_state[
+                        "metodo_login"
+                    ] = "Face ID"
+
+                    st.rerun()
+                else:
+                    st.error(
+                        "A passkey foi reconhecida, mas não pertence "
+                        "ao usuário autorizado deste app."
+                    )
+            else:
+                erro = evento_faceid.get(
+                    "error"
+                )
+
+                if erro and "cancelada" not in erro.lower():
+                    st.warning(erro)
+
+        st.markdown(
+            "<div style='text-align:center;opacity:.58;margin:.6rem 0'>ou</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("### Usar senha")
+
     senha = st.text_input(
         "Senha",
         type="password",
         placeholder="Digite a senha do app",
+        key="senha_login_fallback",
     )
 
-    if st.button("Entrar", width="stretch"):
-        if hmac.compare_digest(str(senha), str(APP_PASSWORD)):
-            st.session_state["autenticado"] = True
+    if st.button(
+        "Entrar",
+        width="stretch",
+        key="entrar_senha",
+    ):
+        if hmac.compare_digest(
+            str(senha),
+            str(APP_PASSWORD),
+        ):
+            st.session_state[
+                "autenticado"
+            ] = True
+
+            st.session_state[
+                "metodo_login"
+            ] = "Senha"
+
             st.rerun()
         else:
             st.error("Senha incorreta.")
+
+    if not faceid_configurado():
+        st.caption(
+            "Face ID ainda não configurado. A senha continua funcionando normalmente."
+        )
 
     st.stop()
 
 
 autenticar_app()
+
+
+# =========================================================
+# SEGURANÇA / CADASTRO DO FACE ID
+# =========================================================
+
+with st.sidebar:
+    st.markdown("### Segurança")
+
+    metodo_login = st.session_state.get(
+        "metodo_login",
+        "Senha",
+    )
+
+    st.caption(
+        f"Sessão atual: {metodo_login}"
+    )
+
+    if st.button(
+        "Bloquear agora",
+        width="stretch",
+        key="bloquear_app",
+    ):
+        for chave in [
+            "autenticado",
+            "metodo_login",
+            "faceid_reg_password",
+        ]:
+            st.session_state.pop(
+                chave,
+                None,
+            )
+
+        st.rerun()
+
+    st.divider()
+
+    if faceid_configurado() and passkey_component is not None:
+        with st.expander(
+            "Ativar ou adicionar Face ID"
+        ):
+            st.caption(
+                "Faça isto uma vez em cada iPhone/dispositivo em que quiser usar a passkey."
+            )
+
+            if not st.session_state.get(
+                "faceid_reg_password"
+            ):
+                senha_faceid = st.text_input(
+                    "Confirme a senha do app",
+                    type="password",
+                    key="senha_ativar_faceid",
+                )
+
+                if st.button(
+                    "Continuar",
+                    width="stretch",
+                    key="preparar_faceid",
+                ):
+                    if hmac.compare_digest(
+                        str(senha_faceid),
+                        str(APP_PASSWORD),
+                    ):
+                        st.session_state[
+                            "faceid_reg_password"
+                        ] = senha_faceid
+
+                        st.rerun()
+                    else:
+                        st.error(
+                            "Senha incorreta."
+                        )
+
+            else:
+                resultado_registro = montar_passkey(
+                    action="register",
+                    key="faceid_register",
+                    password=st.session_state[
+                        "faceid_reg_password"
+                    ],
+                )
+
+                evento_registro = getattr(
+                    resultado_registro,
+                    "auth_result",
+                    None,
+                ) if resultado_registro is not None else None
+
+                if evento_registro:
+                    if evento_registro.get(
+                        "ok"
+                    ):
+                        st.session_state.pop(
+                            "faceid_reg_password",
+                            None,
+                        )
+
+                        st.success(
+                            "Face ID/passkey registrado. Na próxima entrada, use 'Entrar com Face ID'."
+                        )
+                    else:
+                        erro = evento_registro.get(
+                            "error",
+                            "Não foi possível registrar a passkey.",
+                        )
+
+                        st.error(erro)
+
+                if st.button(
+                    "Cancelar",
+                    width="stretch",
+                    key="cancelar_faceid",
+                ):
+                    st.session_state.pop(
+                        "faceid_reg_password",
+                        None,
+                    )
+
+                    st.rerun()
+
+    else:
+        st.caption(
+            "Face ID indisponível até configurar [supabase].publishable_key e [faceid].email nos Secrets."
+        )
 
 
 # =========================================================
