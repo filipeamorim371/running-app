@@ -386,8 +386,12 @@ export default function(component) {
         friendly = 'Passkeys ainda não foram ativadas no Supabase.';
       } else if (/credential.*exists/i.test(raw)) {
         friendly = 'Este Face ID/passkey já está registrado.';
+      } else if (/email_not_confirmed|email not confirmed/i.test(raw)) {
+        friendly = 'A conta de segurança do Supabase ainda não está confirmada.';
       } else if (/invalid login|credentials/i.test(raw)) {
-        friendly = 'Não foi possível validar a conta de segurança.';
+        friendly = 'E-mail ou senha da conta de segurança do Supabase não conferem.';
+      } else if (/invalid api key|api key/i.test(raw)) {
+        friendly = 'A publishable key do Supabase parece estar incorreta.';
       }
 
       showError(friendly);
@@ -594,7 +598,7 @@ with st.sidebar:
         for chave in [
             "autenticado",
             "metodo_login",
-            "faceid_reg_password",
+            "faceid_reg_security_password",
         ]:
             st.session_state.pop(
                 chave,
@@ -613,32 +617,43 @@ with st.sidebar:
                 "Faça isto uma vez em cada iPhone/dispositivo em que quiser usar a passkey."
             )
 
+            st.info(
+                "Para cadastrar o Face ID, use a senha do usuário criado no "
+                "Supabase em Authentication → Users. Ela pode ser diferente "
+                "da senha normal do Running."
+            )
+
+            st.caption(
+                f"Conta de segurança configurada: {FACEID_EMAIL}"
+            )
+
             if not st.session_state.get(
-                "faceid_reg_password"
+                "faceid_reg_security_password"
             ):
-                senha_faceid = st.text_input(
-                    "Confirme a senha do app",
+                senha_seguranca = st.text_input(
+                    "Senha da conta de segurança (Supabase)",
                     type="password",
-                    key="senha_ativar_faceid",
+                    key="senha_conta_supabase_faceid",
+                    help=(
+                        "É a senha do usuário do Supabase Auth, não necessariamente "
+                        "a senha usada para abrir o Running."
+                    ),
                 )
 
                 if st.button(
-                    "Continuar",
+                    "Continuar para registrar Face ID",
                     width="stretch",
                     key="preparar_faceid",
                 ):
-                    if hmac.compare_digest(
-                        str(senha_faceid),
-                        str(APP_PASSWORD),
-                    ):
+                    if senha_seguranca:
                         st.session_state[
-                            "faceid_reg_password"
-                        ] = senha_faceid
+                            "faceid_reg_security_password"
+                        ] = senha_seguranca
 
                         st.rerun()
                     else:
-                        st.error(
-                            "Senha incorreta."
+                        st.warning(
+                            "Digite a senha da conta de segurança do Supabase."
                         )
 
             else:
@@ -646,7 +661,7 @@ with st.sidebar:
                     action="register",
                     key="faceid_register",
                     password=st.session_state[
-                        "faceid_reg_password"
+                        "faceid_reg_security_password"
                     ],
                 )
 
@@ -661,12 +676,13 @@ with st.sidebar:
                         "ok"
                     ):
                         st.session_state.pop(
-                            "faceid_reg_password",
+                            "faceid_reg_security_password",
                             None,
                         )
 
                         st.success(
-                            "Face ID/passkey registrado. Na próxima entrada, use 'Entrar com Face ID'."
+                            "Face ID/passkey registrado. Na próxima entrada, "
+                            "use 'Entrar com Face ID'."
                         )
                     else:
                         erro = evento_registro.get(
@@ -676,13 +692,36 @@ with st.sidebar:
 
                         st.error(erro)
 
+                        if (
+                            "senha" in erro.lower()
+                            or "e-mail" in erro.lower()
+                            or "conta" in erro.lower()
+                        ):
+                            st.caption(
+                                "Confira no Supabase → Authentication → Users se "
+                                "o e-mail acima existe, está confirmado e qual senha "
+                                "foi definida para esse usuário."
+                            )
+
+                if st.button(
+                    "Trocar senha / tentar novamente",
+                    width="stretch",
+                    key="trocar_senha_faceid",
+                ):
+                    st.session_state.pop(
+                        "faceid_reg_security_password",
+                        None,
+                    )
+
+                    st.rerun()
+
                 if st.button(
                     "Cancelar",
                     width="stretch",
                     key="cancelar_faceid",
                 ):
                     st.session_state.pop(
-                        "faceid_reg_password",
+                        "faceid_reg_security_password",
                         None,
                     )
 
