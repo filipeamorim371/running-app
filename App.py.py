@@ -447,6 +447,45 @@ def excluir_treino(id_treino):
     )
 
 
+def atualizar_feedback_treino(
+    id_treino,
+    esforco,
+    observacao_atual=None,
+    feedback=None,
+):
+    observacao = (
+        str(observacao_atual).strip()
+        if observacao_atual
+        and not pd.isna(observacao_atual)
+        else ""
+    )
+
+    feedback = (
+        str(feedback).strip()
+        if feedback
+        else ""
+    )
+
+    if feedback:
+        complemento = f"Feedback pós-treino: {feedback}"
+
+        if complemento not in observacao:
+            observacao = (
+                f"{observacao} | {complemento}"
+                if observacao
+                else complemento
+            )
+
+    return supabase_update(
+        "treinos",
+        {"id": f"eq.{int(id_treino)}"},
+        {
+            "esforco": int(esforco),
+            "observacao": observacao or None,
+        },
+    )
+
+
 # =========================================================
 # PACE / TEMPO
 # =========================================================
@@ -1833,41 +1872,393 @@ def resumo_semanal_coach(historico_df, hoje_local, semanas=8):
     return resultado
 
 
-def atividades_recentes_coach(historico_df, hoje_local, limite=24):
+def atividades_recentes_coach(
+    historico_df,
+    planejamento_df,
+    hoje_local,
+    limite=10,
+):
     if historico_df.empty:
         return []
 
-    df = deduplicar_historico_coach(historico_df)
-    df = df[df["data_dt"] >= hoje_local - timedelta(days=56)].copy()
-    df = df.sort_values("data_plot", ascending=False).head(limite)
+    df = deduplicar_historico_coach(
+        historico_df
+    )
+
+    df = df[
+        df["data_dt"]
+        >= hoje_local - timedelta(days=56)
+    ].copy()
+
+    df = df.sort_values(
+        "data_plot",
+        ascending=False,
+    ).head(limite)
+
+    planos_por_id = {}
+
+    if not planejamento_df.empty:
+        for _, plano in planejamento_df.iterrows():
+            try:
+                planos_por_id[
+                    int(plano["id"])
+                ] = plano
+            except Exception:
+                pass
 
     itens = []
 
     for _, treino in df.iterrows():
         item = {
-            "data": str(treino.get("data", "")),
-            "tipo_registrado": str(treino.get("tipo", "Corrida")),
-            "distancia_km": round(float(treino.get("distancia", 0) or 0), 2),
-            "pace_medio": treino.get("pace") or None,
+            "data": str(
+                treino.get(
+                    "data",
+                    "",
+                )
+            ),
+            "tipo_registrado": str(
+                treino.get(
+                    "tipo",
+                    "Corrida",
+                )
+            ),
+            "distancia_km": round(
+                float(
+                    treino.get(
+                        "distancia",
+                        0,
+                    )
+                    or 0
+                ),
+                2,
+            ),
+            "pace_medio_atividade": (
+                treino.get("pace")
+                or None
+            ),
         }
 
         for origem_coluna, destino in [
-            ("duracao_seg", "duracao_seg"),
-            ("elevacao_m", "elevacao_m"),
-            ("frequencia_cardiaca_media", "fc_media"),
-            ("esforco", "rpe"),
+            (
+                "duracao_seg",
+                "duracao_seg",
+            ),
+            (
+                "elevacao_m",
+                "elevacao_m",
+            ),
+            (
+                "frequencia_cardiaca_media",
+                "fc_media",
+            ),
+            (
+                "esforco",
+                "rpe",
+            ),
         ]:
-            valor = treino.get(origem_coluna)
-            if valor is not None and not pd.isna(valor):
+            valor = treino.get(
+                origem_coluna
+            )
+
+            if (
+                valor is not None
+                and not pd.isna(valor)
+            ):
                 try:
-                    item[destino] = round(float(valor), 1)
+                    item[destino] = round(
+                        float(valor),
+                        1,
+                    )
                 except Exception:
                     item[destino] = valor
+
+        planejamento_id = treino.get(
+            "planejamento_id"
+        )
+
+        if (
+            planejamento_id is not None
+            and not pd.isna(
+                planejamento_id
+            )
+        ):
+            try:
+                plano = planos_por_id.get(
+                    int(
+                        planejamento_id
+                    )
+                )
+            except Exception:
+                plano = None
+
+            if plano is not None:
+                item[
+                    "treino_planejado_associado"
+                ] = {
+                    "tipo": str(
+                        plano.get(
+                            "tipo",
+                            "",
+                        )
+                    ),
+                    "distancia_km": round(
+                        float(
+                            plano.get(
+                                "distancia",
+                                0,
+                            )
+                            or 0
+                        ),
+                        1,
+                    ),
+                    "pace_alvo": (
+                        plano.get(
+                            "pace_alvo"
+                        )
+                        or None
+                    ),
+                    "estrutura": (
+                        plano.get(
+                            "descricao"
+                        )
+                        or None
+                    ),
+                }
 
         itens.append(item)
 
     return itens
 
+
+def perfil_capacidade_coach(
+    historico_df,
+    planejamento_df,
+    hoje_local,
+):
+    """
+    Traduz os dados em referências de capacidade que a IA consegue
+    interpretar sem confundir pace médio total com ritmo de repetições.
+    """
+
+    perfil = {
+        "fase": "retorno consistente aos treinos",
+        "objetivo_atual": "5 km sub-25",
+        "recorde_historico": "24:20",
+        "referencias_declaradas_pelo_corredor": {
+            "rodagem_confortavel_recente": "aprox. 6:20/km",
+            "corrida_continua_forte_atual": "aprox. 5:50–6:00/km por 6–7 km",
+            "intervalado_ja_executado": "6–7 × 400 m a aprox. 4:50–5:00/km, com 1 min de recuperação",
+        },
+        "regra_de_interpretacao": (
+            "As referências declaradas são baseline inicial. "
+            "Dados mais novos com RPE devem passar a ter prioridade."
+        ),
+    }
+
+    if historico_df.empty:
+        return perfil
+
+    df = deduplicar_historico_coach(
+        historico_df
+    )
+
+    limite = (
+        hoje_local
+        - timedelta(days=35)
+    )
+
+    recentes = df[
+        df["data_dt"] >= limite
+    ].copy()
+
+    if recentes.empty:
+        return perfil
+
+    recentes["pace_segundos"] = (
+        recentes["pace"].apply(
+            pace_para_segundos
+        )
+    )
+
+    # Rodagens contínuas: evita intervalados e testes para não
+    # transformar pace médio de sessão em referência de tiro.
+    tipos_leves = {
+        "Rodagem leve",
+        "Recuperação",
+        "Longão",
+        "Corrida",
+        "Outro",
+    }
+
+    leves = recentes[
+        recentes["tipo"].isin(
+            tipos_leves
+        )
+    ].dropna(
+        subset=[
+            "pace_segundos"
+        ]
+    )
+
+    if (
+        "esforco" in leves.columns
+        and not leves.empty
+    ):
+        esforco_num = pd.to_numeric(
+            leves["esforco"],
+            errors="coerce",
+        )
+
+        filtro_rpe = (
+            esforco_num.isna()
+            | (esforco_num <= 6)
+        )
+
+        leves = leves[
+            filtro_rpe
+        ]
+
+    if not leves.empty:
+        leves = leves.sort_values(
+            "data_plot",
+            ascending=False,
+        ).head(6)
+
+        pace_leve = int(
+            leves[
+                "pace_segundos"
+            ].median()
+        )
+
+        perfil[
+            "estimativa_por_dados_recentes"
+        ] = {
+            "pace_continuo_confortavel_mediano": (
+                f"{segundos_para_pace(pace_leve)}/km"
+            ),
+            "amostra_rodagem": int(
+                len(leves)
+            ),
+        }
+
+    # Referências de intervalado planejado + feedback realizado.
+    intervalados = recentes[
+        recentes["tipo"]
+        == "Intervalado"
+    ].sort_values(
+        "data_plot",
+        ascending=False,
+    )
+
+    referencias_intervaladas = []
+
+    if not intervalados.empty:
+        planos_por_id = {}
+
+        if not planejamento_df.empty:
+            for _, plano in planejamento_df.iterrows():
+                try:
+                    planos_por_id[
+                        int(plano["id"])
+                    ] = plano
+                except Exception:
+                    pass
+
+        for _, treino in intervalados.head(3).iterrows():
+            ref = {
+                "data": str(
+                    treino.get(
+                        "data",
+                        "",
+                    )
+                ),
+                "pace_medio_total": (
+                    treino.get(
+                        "pace"
+                    )
+                    or None
+                ),
+            }
+
+            rpe = treino.get(
+                "esforco"
+            )
+
+            if (
+                rpe is not None
+                and not pd.isna(rpe)
+            ):
+                ref["rpe"] = int(
+                    float(rpe)
+                )
+
+            pid = treino.get(
+                "planejamento_id"
+            )
+
+            if (
+                pid is not None
+                and not pd.isna(pid)
+            ):
+                try:
+                    plano = planos_por_id.get(
+                        int(pid)
+                    )
+                except Exception:
+                    plano = None
+
+                if plano is not None:
+                    ref[
+                        "pace_dos_tiros_planejado"
+                    ] = (
+                        plano.get(
+                            "pace_alvo"
+                        )
+                        or None
+                    )
+
+                    ref[
+                        "estrutura_planejada"
+                    ] = (
+                        plano.get(
+                            "descricao"
+                        )
+                        or None
+                    )
+
+            referencias_intervaladas.append(
+                ref
+            )
+
+    if referencias_intervaladas:
+        perfil[
+            "intervalados_recentes"
+        ] = referencias_intervaladas
+
+    rpes = pd.to_numeric(
+        recentes.get(
+            "esforco",
+            pd.Series(dtype=float),
+        ),
+        errors="coerce",
+    ).dropna()
+
+    if not rpes.empty:
+        perfil[
+            "feedback_recente"
+        ] = {
+            "rpe_mediano": round(
+                float(
+                    rpes.median()
+                ),
+                1,
+            ),
+            "treinos_com_feedback": int(
+                len(rpes)
+            ),
+        }
+
+    return perfil
 
 def aderencia_recente_coach(planejamento_df, historico_df, hoje_local):
     if planejamento_df.empty:
@@ -1903,46 +2294,174 @@ def aderencia_recente_coach(planejamento_df, historico_df, hoje_local):
     }
 
 
-def limites_coach_ia(estado, perfil_semana, fadiga, desconforto):
-    base = max(float(estado["volume_base"]), 1.0)
+def limites_coach_ia(
+    estado,
+    perfil_semana,
+    fadiga,
+    desconforto,
+):
+    base = max(
+        float(
+            estado[
+                "volume_base"
+            ]
+        ),
+        1.0,
+    )
 
     if perfil_semana == "Conservador":
         minimo = base * 0.75
-        maximo = min(base * 1.03, base + 2.0)
+        maximo = min(
+            base * 1.03,
+            base + 2.0,
+        )
+
     elif perfil_semana == "Agressivo":
         minimo = base * 0.90
-        maximo = min(base * 1.18, base + 5.0)
+        maximo = min(
+            base * 1.18,
+            base + 5.0,
+        )
+
     else:
         minimo = base * 0.82
-        maximo = min(base * 1.12, base + 4.0)
+        maximo = min(
+            base * 1.12,
+            base + 4.0,
+        )
 
     if fadiga >= 8:
-        maximo = min(maximo, base * 0.82)
-        minimo = min(minimo, maximo * 0.85)
+        maximo = min(
+            maximo,
+            base * 0.82,
+        )
+
+        minimo = min(
+            minimo,
+            maximo * 0.85,
+        )
+
     elif fadiga >= 6:
-        maximo = min(maximo, base * 0.98)
+        maximo = min(
+            maximo,
+            base * 0.98,
+        )
 
     if desconforto == "Moderado/forte":
-        maximo = min(maximo, base * 0.75)
-        minimo = min(minimo, maximo * 0.85)
+        maximo = min(
+            maximo,
+            base * 0.75,
+        )
+
+        minimo = min(
+            minimo,
+            maximo * 0.85,
+        )
+
         max_fortes = 0
+
     elif desconforto == "Leve":
         max_fortes = 1
+
     else:
-        max_fortes = 2 if fadiga <= 6 else 1
+        max_fortes = (
+            2
+            if fadiga <= 6
+            else 1
+        )
+
+    maior_recente = max(
+        float(
+            estado[
+                "maior_corrida_14"
+            ]
+        ),
+        4.0,
+    )
+
+    # O maior treino recente é referência, não teto.
+    # O validador permite progressão controlada, mas ainda mantém
+    # um limite absoluto relativo ao volume semanal.
+    if (
+        desconforto == "Nenhum"
+        and fadiga <= 5
+    ):
+        longao_min_sugerido = (
+            maior_recente + 0.5
+        )
+
+        incremento_max = 2.0
+
+    elif (
+        desconforto == "Nenhum"
+        and fadiga <= 7
+    ):
+        longao_min_sugerido = (
+            maior_recente
+        )
+
+        incremento_max = 1.5
+
+    else:
+        longao_min_sugerido = min(
+            maior_recente,
+            maximo * 0.32,
+        )
+
+        incremento_max = 0.5
 
     longao_max = min(
-        max(float(estado["maior_corrida_14"]) + 2.0, 6.0),
-        maximo * 0.36,
+        maior_recente
+        + incremento_max,
+        maximo * 0.42,
+    )
+
+    longao_max = max(
+        5.5,
+        longao_max,
+    )
+
+    longao_min_sugerido = min(
+        longao_min_sugerido,
+        longao_max,
     )
 
     return {
-        "volume_min_km": round(max(8.0, minimo), 1),
-        "volume_max_km": round(max(10.0, maximo), 1),
-        "longao_max_km": round(max(5.0, longao_max), 1),
-        "max_sessoes_fortes": int(max_fortes),
+        "volume_min_km": round(
+            max(
+                8.0,
+                minimo,
+            ),
+            1,
+        ),
+        "volume_max_km": round(
+            max(
+                10.0,
+                maximo,
+            ),
+            1,
+        ),
+        "longao_referencia_recente_km": round(
+            maior_recente,
+            1,
+        ),
+        "longao_min_sugerido_km": round(
+            max(
+                5.0,
+                longao_min_sugerido,
+            ),
+            1,
+        ),
+        "longao_max_km": round(
+            longao_max,
+            1,
+        ),
+        "max_sessoes_fortes": int(
+            max_fortes
+        ),
         "min_intervalo_horas_entre_fortes": 48,
     }
+
 
 
 def contexto_coach_ia(
@@ -1990,8 +2509,22 @@ def contexto_coach_ia(
             "pace_referencia": segundos_para_pace(estado["pace_ref"]),
             "pouco_historico_recente": bool(estado["modo_retorno"]),
         },
-        "semanas_anteriores": resumo_semanal_coach(historico_df, hoje_local, 4),
-        "atividades_recentes": atividades_recentes_coach(historico_df, hoje_local, 10),
+        "perfil_de_capacidade_atual": perfil_capacidade_coach(
+            historico_df,
+            planejamento_df,
+            hoje_local,
+        ),
+        "semanas_anteriores": resumo_semanal_coach(
+            historico_df,
+            hoje_local,
+            4,
+        ),
+        "atividades_recentes": atividades_recentes_coach(
+            historico_df,
+            planejamento_df,
+            hoje_local,
+            10,
+        ),
         "aderencia_28_dias": aderencia_recente_coach(
             planejamento_df,
             historico_df,
@@ -2129,12 +2662,20 @@ def chamar_openai_coach(contexto):
 Crie uma semana de corrida para 5 km usando SOMENTE o JSON fornecido.
 
 Regras:
-- histórico recente vale mais que recorde antigo;
+- histórico recente + RPE valem mais que recorde antigo;
+- use perfil_de_capacidade_atual como baseline, não apenas pace médio das atividades;
+- não reduza arbitrariamente um estímulo já tolerado; só faça isso se fadiga,
+  desconforto, RPE alto ou dado recente justificar;
+- em intervalados, pace_medio_atividade inclui aquecimento/recuperação:
+  NÃO use esse número como ritmo dos tiros;
+- se houver treino_planejado_associado ou intervalados_recentes, use o pace dos tiros
+  e a estrutura planejada como referência específica;
 - respeite datas, número de treinos e todos os limites;
 - máximo de sessões fortes = limite recebido; deixe >=48 h entre elas;
-- longão <= limite; volume dentro da faixa;
+- maior corrida recente é referência, não teto: quando fadiga/desconforto permitem,
+  use a faixa longao_min_sugerido_km–longao_max_km para progressão controlada;
+- volume total deve ficar dentro da faixa validada;
 - intervalado: distância = total aproximado corrido, com aquecimento/desaquecimento;
-- não confunda pace médio da atividade com pace dos tiros;
 - fadiga/desconforto altos reduzem intensidade;
 - não invente FC, RPE, lesão ou desempenho;
 - foco: consistência + evolução específica para 5 km sub-25;
@@ -3452,6 +3993,23 @@ with historico_tab:
                         )
                     )
 
+                esforco_atual = treino.get(
+                    "esforco"
+                )
+
+                tem_rpe = (
+                    esforco_atual is not None
+                    and not pd.isna(
+                        esforco_atual
+                    )
+                )
+
+                if tem_rpe:
+                    st.caption(
+                        f"Esforço percebido: "
+                        f"{int(float(esforco_atual))}/10"
+                    )
+
                 if treino.get(
                     "observacao"
                 ):
@@ -3460,6 +4018,62 @@ with historico_tab:
                             "observacao"
                         ]
                     )
+
+                if not tem_rpe:
+                    with st.expander(
+                        "Como foi esse treino?"
+                    ):
+                        st.caption(
+                            "Esse feedback ajuda o Coach a entender se "
+                            "o estímulo foi fácil, adequado ou pesado."
+                        )
+
+                        with st.form(
+                            f"feedback_treino_{int(treino['id'])}"
+                        ):
+                            rpe_feedback = st.slider(
+                                "Esforço percebido (RPE)",
+                                min_value=1,
+                                max_value=10,
+                                value=5,
+                                help=(
+                                    "1 = muito fácil; 10 = esforço máximo."
+                                ),
+                            )
+
+                            nota_feedback = st.text_input(
+                                "Comentário opcional",
+                                placeholder=(
+                                    "Ex.: sobrou bastante; pernas pesadas; "
+                                    "tiros controlados."
+                                ),
+                            )
+
+                            salvar_feedback = (
+                                st.form_submit_button(
+                                    "Salvar feedback",
+                                    width="stretch",
+                                )
+                            )
+
+                            if salvar_feedback:
+                                atualizar_feedback_treino(
+                                    treino["id"],
+                                    rpe_feedback,
+                                    treino.get(
+                                        "observacao"
+                                    ),
+                                    nota_feedback,
+                                )
+
+                                st.session_state[
+                                    "mensagem"
+                                ] = (
+                                    "Feedback salvo. O Coach usará "
+                                    "essa informação nos próximos planos."
+                                )
+
+                                st.rerun()
 
 
 # =========================================================
@@ -3816,6 +4430,60 @@ with coach_tab:
         f"{segundos_para_pace(estado_coach['pace_ref'])}/km",
     )
 
+    perfil_capacidade_tela = perfil_capacidade_coach(
+        historico,
+        planejamento,
+        hoje,
+    )
+
+    with st.expander(
+        "O que o Coach entende sobre sua capacidade atual"
+    ):
+        refs = perfil_capacidade_tela[
+            "referencias_declaradas_pelo_corredor"
+        ]
+
+        st.write(
+            "• Rodagem confortável: "
+            f"{refs['rodagem_confortavel_recente']}"
+        )
+
+        st.write(
+            "• Corrida contínua forte: "
+            f"{refs['corrida_continua_forte_atual']}"
+        )
+
+        st.write(
+            "• Intervalado já executado: "
+            f"{refs['intervalado_ja_executado']}"
+        )
+
+        estimativa = perfil_capacidade_tela.get(
+            "estimativa_por_dados_recentes"
+        )
+
+        if estimativa:
+            st.write(
+                "• Pace confortável estimado pelos dados recentes: "
+                f"{estimativa['pace_continuo_confortavel_mediano']}"
+            )
+
+        feedback_recente = perfil_capacidade_tela.get(
+            "feedback_recente"
+        )
+
+        if feedback_recente:
+            st.write(
+                "• RPE mediano registrado: "
+                f"{feedback_recente['rpe_mediano']}/10 "
+                f"({feedback_recente['treinos_com_feedback']} treino(s))"
+            )
+
+        st.caption(
+            "Conforme você registrar RPE após os treinos, os dados recentes "
+            "passam a ter mais peso que essas referências iniciais."
+        )
+
     if not OPENAI_API_KEY:
         st.warning(
             "A IA ainda não está conectada. Adicione a seção [openai] nos "
@@ -3979,6 +4647,14 @@ with coach_tab:
                 f"{limites['volume_min_km']:.1f}–{limites['volume_max_km']:.1f} km",
             )
 
+            st.caption(
+                "Longão: referência recente "
+                f"{limites['longao_referencia_recente_km']:.1f} km · "
+                "faixa de progressão sugerida "
+                f"{limites['longao_min_sugerido_km']:.1f}–"
+                f"{limites['longao_max_km']:.1f} km."
+            )
+
         if resultado_ia.get("alerta"):
             st.info(resultado_ia["alerta"])
 
@@ -4072,7 +4748,8 @@ with coach_tab:
 
     st.divider()
     st.caption(
-        "Modo econômico: 4 semanas resumidas + até 10 atividades recentes, "
-        "raciocínio desativado e resposta limitada. Nenhuma chamada à IA acontece "
-        "ao abrir o app ou sincronizar o Strava."
+        "Modo econômico: 4 semanas resumidas + até 10 atividades recentes. "
+        "O Coach agora diferencia pace médio de atividade e ritmo de tiros, usa RPE "
+        "pós-treino e trata o maior longão recente como referência, não como teto. "
+        "Nenhuma chamada à IA acontece ao abrir o app ou sincronizar o Strava."
     )
