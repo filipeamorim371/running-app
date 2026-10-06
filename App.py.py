@@ -4790,6 +4790,183 @@ with semana_tab:
                     )
 
 
+
+    # -----------------------------------------------------
+    # PRÓXIMOS PLANEJAMENTOS
+    # -----------------------------------------------------
+
+    st.divider()
+
+    st.subheader(
+        "Próximos planejamentos"
+    )
+
+    st.caption(
+        "Treinos já salvos para depois da semana atual, "
+        "incluindo planos aceitos no Coach."
+    )
+
+    proximos_planejamentos = (
+        planejamento[
+            planejamento[
+                "data_dt"
+            ]
+            > fim_semana
+        ].copy()
+        if not planejamento.empty
+        else pd.DataFrame()
+    )
+
+    if proximos_planejamentos.empty:
+        plano_coach_pendente = st.session_state.get(
+            "plano_coach"
+        )
+
+        if plano_coach_pendente:
+            st.info(
+                "Existe uma sugestão do Coach aguardando aprovação. "
+                "Aceite o plano na aba Coach para ele aparecer aqui."
+            )
+        else:
+            st.info(
+                "Nenhum treino planejado após esta semana."
+            )
+
+    else:
+        proximos_planejamentos[
+            "inicio_semana"
+        ] = proximos_planejamentos[
+            "data_dt"
+        ].apply(
+            lambda d: d
+            - timedelta(
+                days=d.weekday()
+            )
+        )
+
+        grupos_semana = (
+            proximos_planejamentos.groupby(
+                "inicio_semana",
+                sort=True,
+            )
+        )
+
+        for inicio_proxima, grupo in grupos_semana:
+            fim_proxima = (
+                inicio_proxima
+                + timedelta(days=6)
+            )
+
+            km_proximos = float(
+                grupo[
+                    "distancia"
+                ].sum()
+            )
+
+            qtd_proximos = len(
+                grupo
+            )
+
+            st.markdown(
+                f"### "
+                f"{inicio_proxima.strftime('%d/%m')} "
+                f"– "
+                f"{fim_proxima.strftime('%d/%m')}"
+            )
+
+            resumo1, resumo2 = (
+                st.columns(2)
+            )
+
+            resumo1.metric(
+                "Treinos planejados",
+                qtd_proximos,
+            )
+
+            resumo2.metric(
+                "Volume planejado",
+                f"{km_proximos:.1f} km",
+            )
+
+            for _, treino in (
+                grupo.sort_values(
+                    "data_dt"
+                ).iterrows()
+            ):
+                realizado = (
+                    realizado_do_planejado(
+                        treino,
+                        historico,
+                    )
+                )
+
+                data_treino = treino[
+                    "data_dt"
+                ]
+
+                with st.container(
+                    border=True
+                ):
+                    topo1, topo2 = (
+                        st.columns([3, 1])
+                    )
+
+                    topo1.caption(
+                        f"{dias_curtos[data_treino.weekday()]} "
+                        f"· "
+                        f"{data_treino.strftime('%d/%m')}"
+                    )
+
+                    topo1.markdown(
+                        f"### {treino['tipo']}"
+                    )
+
+                    topo2.write(
+                        "✅ Feito"
+                        if realizado is not None
+                        else "○ Planejado"
+                    )
+
+                    p1, p2 = (
+                        st.columns(2)
+                    )
+
+                    p1.metric(
+                        "Distância",
+                        (
+                            f"{treino['distancia']:.1f} km"
+                            if treino[
+                                "distancia"
+                            ] > 0
+                            else "-"
+                        ),
+                    )
+
+                    p2.metric(
+                        "Pace alvo",
+                        (
+                            treino[
+                                "pace_alvo"
+                            ]
+                            if treino[
+                                "pace_alvo"
+                            ]
+                            else "-"
+                        ),
+                    )
+
+                    if treino[
+                        "descricao"
+                    ]:
+                        st.caption(
+                            treino[
+                                "descricao"
+                            ]
+                        )
+
+            st.write("")
+
+
 # =========================================================
 # PLANEJAR
 # =========================================================
