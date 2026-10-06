@@ -711,10 +711,14 @@ def importar_atividades_strava():
 
 
 # =========================================================
-# COACH ADAPTATIVO
+# COACH ADAPTATIVO V2
 # =========================================================
 
-def preparar_historico_coach(historico_df):
+def deduplicar_historico_coach(historico_df):
+    """
+    Evita que a mesma corrida conte duas vezes no motor do Coach
+    quando ela existe manualmente e também veio do Strava.
+    """
     if historico_df.empty:
         return historico_df.copy()
 
@@ -727,6 +731,52 @@ def preparar_historico_coach(historico_df):
 
     df["pace_segundos"] = df["pace"].apply(
         pace_para_segundos
+    )
+
+    df["distancia"] = pd.to_numeric(
+        df["distancia"],
+        errors="coerce",
+    ).fillna(0.0)
+
+    # Distâncias próximas entram no mesmo agrupamento.
+    df["dist_key"] = (
+        df["distancia"] * 2
+    ).round() / 2
+
+    # Se houver duplicata manual + Strava, preferimos Strava.
+    df["origem_rank"] = (
+        df["origem"]
+        .fillna("manual")
+        .map(
+            {
+                "strava": 0,
+                "manual": 1,
+            }
+        )
+        .fillna(2)
+    )
+
+    df = df.sort_values(
+        [
+            "data_plot",
+            "dist_key",
+            "origem_rank",
+            "id",
+        ],
+        ascending=[
+            False,
+            True,
+            True,
+            False,
+        ],
+    )
+
+    df = df.drop_duplicates(
+        subset=[
+            "data",
+            "dist_key",
+        ],
+        keep="first",
     )
 
     return df
@@ -742,19 +792,32 @@ def volume_periodo(df, inicio, fim):
     )
 
     return float(
-        df.loc[mask, "distancia"].sum()
+        df.loc[
+            mask,
+            "distancia",
+        ].sum()
     )
 
 
-def pace_referencia_recente(historico_df, hoje_local):
+def pace_referencia_recente(
+    historico_df,
+    hoje_local,
+):
+    """
+    Usa apenas corridas recentes e dá preferência às rodagens
+    contínuas, evitando que tiros e testes distorçam o pace-base.
+    """
     if historico_df.empty:
         return 380  # 6:20/km
 
-    df = preparar_historico_coach(
+    df = deduplicar_historico_coach(
         historico_df
     )
 
-    limite = hoje_local - timedelta(days=35)
+    limite = (
+        hoje_local
+        - timedelta(days=28)
+    )
 
     df = df[
         df["data_dt"] >= limite
@@ -763,8 +826,6 @@ def pace_referencia_recente(historico_df, hoje_local):
     if df.empty:
         return 380
 
-    # Preferimos rodagens/corridas contínuas; intervalados e testes
-    # costumam distorcer o pace médio como referência de treino leve.
     preferidos = df[
         ~df["tipo"].isin(
             [
@@ -773,16 +834,26 @@ def pace_referencia_recente(historico_df, hoje_local):
             ]
         )
     ].dropna(
-        subset=["pace_segundos"]
+        subset=[
+            "pace_segundos"
+        ]
     )
 
     if preferidos.empty:
         preferidos = df.dropna(
-            subset=["pace_segundos"]
+            subset=[
+                "pace_segundos"
+            ]
         )
 
     if preferidos.empty:
         return 380
+
+    # Só os cinco treinos contínuos mais recentes.
+    preferidos = preferidos.sort_values(
+        "data_plot",
+        ascending=False,
+    ).head(5)
 
     mediana = int(
         preferidos[
@@ -790,7 +861,7 @@ def pace_referencia_recente(historico_df, hoje_local):
         ].median()
     )
 
-    # Faixa plausível para uma referência recreativa
+    # Limites defensivos.
     return max(
         300,
         min(
@@ -804,103 +875,228 @@ def analisar_estado_coach(
     historico_df,
     hoje_local,
 ):
-    semana_atual_inicio = (
+    df = deduplicar_historico_coach(
+        historico_df
+    )
+
+    inicio_semana_atual = (
         hoje_local
         - timedelta(
             days=hoje_local.weekday()
         )
     )
 
-    semana_anterior_inicio = (
-        semana_atual_inicio
-        - timedelta(days=7)
-    )
-
-    semana_anterior_fim = (
-        semana_atual_inicio
-        - timedelta(days=1)
-    )
-
-    volume_semana_anterior = (
-        volume_periodo(
-            historico_df,
-            semana_anterior_inicio,
-            semana_anterior_fim,
-        )
-    )
-
-    ultimos_7_inicio = (
-        hoje_local
-        - timedelta(days=6)
-    )
-
-    volume_ultimos_7 = volume_periodo(
-        historico_df,
-        ultimos_7_inicio,
-        hoje_local,
-    )
-
-    ultimos_28_inicio = (
+    # Últimos 28 dias
+    inicio_28 = (
         hoje_local
         - timedelta(days=27)
     )
 
-    volume_28 = volume_periodo(
-        historico_df,
-        ultimos_28_inicio,
-        hoje_local,
+    recentes_28 = (
+        df[
+            df["data_dt"] >= inicio_28
+        ].copy()
+        if not df.empty
+        else pd.DataFrame()
     )
 
-    treinos_28 = 0
+    volume_28 = (
+        float(
+            recentes_28[
+                "distancia"
+            ].sum()
+        )
+        if not recentes_28.empty
+        else 0.0
+    )
 
-    if not historico_df.empty:
-        treinos_28 = len(
-            historico_df[
-                historico_df["data_dt"]
-                >= ultimos_28_inicio
-            ]
+    treinos_28 = len(
+        recentes_28
+    )
+
+    # Semanas completas anteriores, sem usar a semana corrente.
+    semanas = []
+
+    for i in range(
+        1,
+        5,
+    ):
+        fim = (
+            inicio_semana_atual
+            - timedelta(
+                days=1 + 7 * (i - 1)
+            )
         )
 
-    # Base principal: última semana completa.
-    # Se ainda não houver uma semana completa registrada,
-    # usa os últimos 7 dias.
+        inicio = (
+            fim
+            - timedelta(days=6)
+        )
+
+        vol = volume_periodo(
+            df,
+            inicio,
+            fim,
+        )
+
+        qtd = 0
+
+        if not df.empty:
+            qtd = len(
+                df[
+                    (df["data_dt"] >= inicio)
+                    & (df["data_dt"] <= fim)
+                ]
+            )
+
+        semanas.append(
+            {
+                "inicio": inicio,
+                "fim": fim,
+                "volume": vol,
+                "treinos": qtd,
+            }
+        )
+
+    semanas_ativas = [
+        s
+        for s in semanas
+        if s["treinos"] > 0
+    ]
+
+    ultima_semana = (
+        semanas_ativas[0]
+        if semanas_ativas
+        else None
+    )
+
+    volume_ultima_semana = (
+        ultima_semana[
+            "volume"
+        ]
+        if ultima_semana
+        else 0.0
+    )
+
+    # Rolling 7 dias funciona bem quando a pessoa voltou no meio
+    # de uma semana ou ainda não completou uma semana fechada.
+    inicio_7 = (
+        hoje_local
+        - timedelta(days=6)
+    )
+
+    volume_ultimos_7 = (
+        volume_periodo(
+            df,
+            inicio_7,
+            hoje_local,
+        )
+    )
+
+    # Detecta fase de retorno / pouco histórico recente.
+    semanas_ativas_21 = 0
+
+    for s in semanas[:3]:
+        if s["treinos"] > 0:
+            semanas_ativas_21 += 1
+
+    modo_retorno = (
+        treinos_28 < 10
+        or semanas_ativas_21 <= 1
+    )
+
+    # Base principal: semana completa mais recente.
+    # Se não existir, usa rolling 7.
     volume_base = (
-        volume_semana_anterior
-        if volume_semana_anterior > 0
+        volume_ultima_semana
+        if volume_ultima_semana > 0
         else volume_ultimos_7
     )
 
-    if volume_base <= 0 and volume_28 > 0:
-        semanas_ativas_estimadas = max(
-            1,
-            min(
-                4,
-                round(
-                    treinos_28 / 3
-                ),
-            ),
+    # Se os dois existem e divergem demais, usa o menor valor
+    # para não transformar um pico isolado em nova referência.
+    if (
+        volume_ultima_semana > 0
+        and volume_ultimos_7 > 0
+    ):
+        maior = max(
+            volume_ultima_semana,
+            volume_ultimos_7,
         )
 
-        volume_base = (
-            volume_28
-            / semanas_ativas_estimadas
+        menor = min(
+            volume_ultima_semana,
+            volume_ultimos_7,
         )
+
+        if maior > menor * 1.35:
+            volume_base = menor
 
     if volume_base <= 0:
-        volume_base = 18.0
+        volume_base = 20.0
 
-    pace_ref = pace_referencia_recente(
-        historico_df,
-        hoje_local,
+    # Maior corrida dos últimos 14 dias:
+    # usada para limitar o longão da semana seguinte.
+    inicio_14 = (
+        hoje_local
+        - timedelta(days=13)
+    )
+
+    recentes_14 = (
+        df[
+            df["data_dt"] >= inicio_14
+        ]
+        if not df.empty
+        else pd.DataFrame()
+    )
+
+    maior_corrida_14 = (
+        float(
+            recentes_14[
+                "distancia"
+            ].max()
+        )
+        if not recentes_14.empty
+        else 6.0
+    )
+
+    if pd.isna(
+        maior_corrida_14
+    ):
+        maior_corrida_14 = 6.0
+
+    pace_ref = (
+        pace_referencia_recente(
+            df,
+            hoje_local,
+        )
     )
 
     return {
-        "volume_semana_anterior": volume_semana_anterior,
-        "volume_ultimos_7": volume_ultimos_7,
-        "volume_28": volume_28,
-        "treinos_28": treinos_28,
-        "volume_base": float(volume_base),
-        "pace_ref": int(pace_ref),
+        "volume_ultima_semana": float(
+            volume_ultima_semana
+        ),
+        "volume_ultimos_7": float(
+            volume_ultimos_7
+        ),
+        "volume_28": float(
+            volume_28
+        ),
+        "treinos_28": int(
+            treinos_28
+        ),
+        "volume_base": float(
+            volume_base
+        ),
+        "maior_corrida_14": float(
+            maior_corrida_14
+        ),
+        "pace_ref": int(
+            pace_ref
+        ),
+        "modo_retorno": bool(
+            modo_retorno
+        ),
     }
 
 
@@ -910,100 +1106,264 @@ def arredondar_meio_km(valor):
     ) / 2
 
 
-def distribuir_distancias(
-    volume_alvo,
-    n_treinos,
+def calcular_volume_alvo(
+    estado,
+    intensidade_semana,
+    fadiga,
 ):
-    if n_treinos == 3:
-        pesos = [
-            0.28,
-            0.28,
-            0.44,
-        ]
-    elif n_treinos == 4:
-        pesos = [
-            0.23,
-            0.24,
-            0.22,
-            0.31,
-        ]
-    else:
-        pesos = [
-            0.18,
-            0.20,
-            0.16,
-            0.18,
-            0.28,
-        ]
-
-    distancias = [
-        max(
-            3.5,
-            arredondar_meio_km(
-                volume_alvo * peso
-            ),
-        )
-        for peso in pesos
+    base = estado[
+        "volume_base"
     ]
 
-    diferenca = (
-        arredondar_meio_km(volume_alvo)
-        - sum(distancias)
+    multiplicadores = {
+        "Leve": 0.88,
+        "Normal": 1.00,
+        "Progressiva": 1.05,
+    }
+
+    alvo = (
+        base
+        * multiplicadores[
+            intensidade_semana
+        ]
     )
 
-    distancias[-1] = max(
-        4.0,
+    if fadiga >= 8:
+        alvo *= 0.78
+
+    elif fadiga >= 6:
+        alvo *= 0.90
+
+    # Durante retorno, uma semana progressiva sobe no máximo 5%.
+    # Fora do retorno, no máximo 8%.
+    limite_crescimento = (
+        1.05
+        if estado[
+            "modo_retorno"
+        ]
+        else 1.08
+    )
+
+    if alvo > base:
+        alvo = min(
+            alvo,
+            base
+            * limite_crescimento,
+            base + 2.5,
+        )
+
+    # Não inventa volume quando a base é baixa.
+    alvo = max(
+        base * 0.78,
+        alvo,
+    )
+
+    return arredondar_meio_km(
+        alvo
+    )
+
+
+def construir_sessoes(
+    volume_alvo,
+    n_treinos,
+    estado,
+    fadiga,
+):
+    """
+    Diferente da V1, cada tipo de treino tem um tamanho coerente.
+    A distância do intervalado deixa de ser um simples percentual
+    do volume semanal.
+    """
+    maior_recente = estado[
+        "maior_corrida_14"
+    ]
+
+    # Longão: no máximo +1 km sobre a maior corrida recente
+    # e no máximo ~32% da semana.
+    longao = min(
+        maior_recente + 1.0,
+        volume_alvo * 0.32,
+    )
+
+    longao = max(
+        5.5,
         arredondar_meio_km(
-            distancias[-1]
-            + diferenca
+            longao
         ),
     )
 
-    return distancias
-
-
-def montar_tipos_sessoes(
-    n_treinos,
-    fadiga,
-):
     if n_treinos == 3:
-        tipos = [
-            "Rodagem leve",
-            "Intervalado",
-            "Longão",
-        ]
-    elif n_treinos == 4:
-        tipos = [
-            "Rodagem leve",
-            "Progressivo",
-            "Intervalado",
-            "Longão",
-        ]
-    else:
-        tipos = [
-            "Rodagem leve",
-            "Intervalado",
-            "Rodagem leve",
-            "Progressivo",
-            "Longão",
-        ]
+        # Intervalado = ~4.5-5 km totais de corrida,
+        # dependendo da recuperação.
+        intervalado = 4.5
 
-    # Se a percepção de cansaço estiver alta,
-    # trocamos uma sessão de qualidade por leve.
-    if fadiga >= 8:
-        tipos = [
+        leve = (
+            volume_alvo
+            - intervalado
+            - longao
+        )
+
+        leve = max(
+            4.5,
+            arredondar_meio_km(
+                leve
+            ),
+        )
+
+        sessoes = [
             (
-                "Rodagem leve"
-                if tipo in {
-                    "Intervalado",
-                    "Progressivo",
-                }
-                else tipo
-            )
-            for tipo in tipos
+                "Rodagem leve",
+                leve,
+            ),
+            (
+                "Intervalado",
+                intervalado,
+            ),
+            (
+                "Longão",
+                longao,
+            ),
         ]
 
-    return tipos
+    elif n_treinos == 4:
+        intervalado = 4.5
+
+        progressivo = min(
+            6.0,
+            max(
+                5.0,
+                arredondar_meio_km(
+                    volume_alvo
+                    * 0.26
+                ),
+            ),
+        )
+
+        leve = (
+            volume_alvo
+            - intervalado
+            - progressivo
+            - longao
+        )
+
+        leve = max(
+            4.5,
+            arredondar_meio_km(
+                leve
+            ),
+        )
+
+        # Se os mínimos empurraram o volume para cima,
+        # reduzimos primeiro o progressivo.
+        excesso = (
+            leve
+            + progressivo
+            + intervalado
+            + longao
+            - volume_alvo
+        )
+
+        if excesso > 0:
+            progressivo = max(
+                5.0,
+                arredondar_meio_km(
+                    progressivo
+                    - excesso
+                ),
+            )
+
+        sessoes = [
+            (
+                "Rodagem leve",
+                leve,
+            ),
+            (
+                "Progressivo",
+                progressivo,
+            ),
+            (
+                "Intervalado",
+                intervalado,
+            ),
+            (
+                "Longão",
+                longao,
+            ),
+        ]
+
+    else:
+        intervalado = 4.5
+
+        progressivo = min(
+            6.0,
+            max(
+                5.0,
+                arredondar_meio_km(
+                    volume_alvo
+                    * 0.22
+                ),
+            ),
+        )
+
+        recuperacao = 4.0
+
+        restante = (
+            volume_alvo
+            - intervalado
+            - progressivo
+            - recuperacao
+            - longao
+        )
+
+        leve = max(
+            4.5,
+            arredondar_meio_km(
+                restante
+            ),
+        )
+
+        sessoes = [
+            (
+                "Rodagem leve",
+                leve,
+            ),
+            (
+                "Intervalado",
+                intervalado,
+            ),
+            (
+                "Rodagem leve",
+                recuperacao,
+            ),
+            (
+                "Progressivo",
+                progressivo,
+            ),
+            (
+                "Longão",
+                longao,
+            ),
+        ]
+
+    # Cansaço alto: tira os estímulos fortes.
+    if fadiga >= 8:
+        sessoes = [
+            (
+                (
+                    "Rodagem leve"
+                    if tipo in {
+                        "Intervalado",
+                        "Progressivo",
+                    }
+                    else tipo
+                ),
+                distancia,
+            )
+            for tipo, distancia
+            in sessoes
+        ]
+
+    return sessoes
 
 
 def gerar_plano_coach(
@@ -1019,80 +1379,66 @@ def gerar_plano_coach(
         hoje_local,
     )
 
-    base = estado["volume_base"]
-
-    multiplicadores = {
-        "Leve": 0.85,
-        "Normal": 1.03,
-        "Progressiva": 1.07,
-    }
-
     volume_alvo = (
-        base
-        * multiplicadores[
-            intensidade_semana
-        ]
-    )
-
-    if fadiga >= 8:
-        volume_alvo *= 0.80
-    elif fadiga >= 6:
-        volume_alvo *= 0.90
-
-    # Cap de crescimento: no máximo +8% e no máximo +3 km
-    if volume_alvo > base:
-        volume_alvo = min(
-            volume_alvo,
-            base * 1.08,
-            base + 3.0,
+        calcular_volume_alvo(
+            estado,
+            intensidade_semana,
+            fadiga,
         )
-
-    # Piso apenas para evitar uma semana irrealisticamente curta
-    # quando o histórico ainda é pequeno.
-    volume_alvo = max(
-        12.0,
-        volume_alvo,
     )
 
-    volume_alvo = arredondar_meio_km(
-        volume_alvo
-    )
-
-    distancias = distribuir_distancias(
+    sessoes = construir_sessoes(
         volume_alvo,
         n_treinos,
-    )
-
-    tipos = montar_tipos_sessoes(
-        n_treinos,
+        estado,
         fadiga,
     )
 
-    pace_ref = estado["pace_ref"]
+    # O total real das sessões prevalece sobre o volume-alvo
+    # caso os mínimos técnicos do treino exijam pequena diferença.
+    volume_real_plano = arredondar_meio_km(
+        sum(
+            distancia
+            for _, distancia
+            in sessoes
+        )
+    )
 
-    easy_min = pace_ref - 10
-    easy_max = pace_ref + 20
+    pace_ref = estado[
+        "pace_ref"
+    ]
 
+    # Faixas centradas no estado atual, não no recorde antigo.
     easy_min = max(
-        330,
-        easy_min,
+        315,
+        pace_ref - 5,
     )
 
     easy_max = min(
         450,
-        easy_max,
+        pace_ref + 25,
     )
 
-    progressivo_inicio = easy_max
+    progressivo_inicio = min(
+        450,
+        pace_ref + 15,
+    )
+
     progressivo_fim = max(
-        320,
-        pace_ref - 25,
+        315,
+        pace_ref - 35,
     )
 
-    # Meta sub-25: 5:00/km. Em 400 m, um alvo ligeiramente
-    # mais rápido que o pace de prova é coerente, sem exagerar.
-    intervalo_rapido = 4 * 60 + 45
-    intervalo_lento = 4 * 60 + 58
+    # Para objetivo sub-25: estímulo curto próximo/levemente
+    # abaixo de 5:00/km, sem transformar o treino em teste.
+    intervalo_rapido = (
+        4 * 60
+        + 50
+    )
+
+    intervalo_lento = (
+        5 * 60
+    )
 
     proxima_segunda = (
         hoje_local
@@ -1114,29 +1460,31 @@ def gerar_plano_coach(
         "Dom": 6,
     }
 
-    datas = [
-        proxima_segunda
-        + timedelta(
-            days=offsets[dia]
-        )
-        for dia in dias_escolhidos
-    ]
-
-    datas = sorted(datas)
+    datas = sorted(
+        [
+            proxima_segunda
+            + timedelta(
+                days=offsets[
+                    dia
+                ]
+            )
+            for dia in dias_escolhidos
+        ]
+    )
 
     plano = []
 
-    for i, (
+    for (
         data_treino,
-        tipo,
-        distancia,
-    ) in enumerate(
-        zip(
-            datas,
-            tipos,
-            distancias,
-        )
+        sessao,
+    ) in zip(
+        datas,
+        sessoes,
     ):
+        tipo, distancia = (
+            sessao
+        )
+
         if tipo == "Rodagem leve":
             pace_alvo = (
                 f"{segundos_para_pace(easy_min)}"
@@ -1145,9 +1493,9 @@ def gerar_plano_coach(
             )
 
             descricao = (
-                "Corrida confortável, conversa possível. "
-                "O objetivo é acumular volume sem transformar "
-                "a rodagem em treino forte."
+                "Corrida confortável, em esforço leve. "
+                "Se o pace ficar um pouco mais lento em subida "
+                "ou calor, mantenha o esforço e não force o relógio."
             )
 
         elif tipo == "Progressivo":
@@ -1158,8 +1506,9 @@ def gerar_plano_coach(
             )
 
             descricao = (
-                "Comece controlado e acelere gradualmente. "
-                "A parte final deve ser firme, mas sem sprint."
+                "Divida o treino em três blocos semelhantes: "
+                "leve no início, ritmo estável no meio e firme no final. "
+                "Termine controlado, sem sprint."
             )
 
         elif tipo == "Intervalado":
@@ -1171,39 +1520,55 @@ def gerar_plano_coach(
 
             reps = 6
 
-            if estado["treinos_28"] >= 14 and fadiga <= 4:
+            if (
+                not estado[
+                    "modo_retorno"
+                ]
+                and estado[
+                    "treinos_28"
+                ] >= 14
+                and fadiga <= 4
+            ):
                 reps = 7
 
             descricao = (
-                f"1 km leve + {reps} × 400 m no pace-alvo, "
+                f"1 km leve + {reps} × 400 m a "
+                f"{segundos_para_pace(intervalo_rapido)}–"
+                f"{segundos_para_pace(intervalo_lento)}/km, "
                 "com 1 min caminhando ou trotando entre as repetições, "
-                "e 1 km leve para finalizar."
+                "e 1 km leve no final. A distância exibida é aproximada."
             )
 
         else:  # Longão
             pace_alvo = (
-                f"{segundos_para_pace(easy_min + 5)}"
+                f"{segundos_para_pace(pace_ref)}"
                 f"–"
-                f"{segundos_para_pace(easy_max + 10)}/km"
+                f"{segundos_para_pace(min(450, pace_ref + 30))}/km"
             )
 
             descricao = (
                 "Rodagem longa confortável. "
-                "Priorize constância e termine com sensação "
-                "de que ainda conseguiria correr mais alguns minutos."
+                "O objetivo é ampliar a duração sem acelerar no final. "
+                "Termine com sensação de reserva."
             )
 
         plano.append(
             {
                 "data": data_treino,
                 "tipo": tipo,
-                "distancia": float(distancia),
+                "distancia": float(
+                    distancia
+                ),
                 "pace_alvo": pace_alvo,
                 "descricao": descricao,
             }
         )
 
-    return plano, estado, volume_alvo
+    return (
+        plano,
+        estado,
+        volume_real_plano,
+    )
 
 
 def salvar_plano_coach(
@@ -1214,7 +1579,9 @@ def salvar_plano_coach(
 
     if not planejamento_df.empty:
         datas_existentes = set(
-            planejamento_df["data"].astype(str)
+            planejamento_df[
+                "data"
+            ].astype(str)
         )
 
     salvos = 0
@@ -1222,7 +1589,9 @@ def salvar_plano_coach(
 
     for treino in plano:
         data_texto = str(
-            treino["data"]
+            treino[
+                "data"
+            ]
         )
 
         if data_texto in datas_existentes:
@@ -1230,19 +1599,33 @@ def salvar_plano_coach(
             continue
 
         salvar_planejamento(
-            treino["data"],
-            treino["tipo"],
-            treino["distancia"],
-            treino["pace_alvo"],
-            treino["descricao"],
+            treino[
+                "data"
+            ],
+            treino[
+                "tipo"
+            ],
+            treino[
+                "distancia"
+            ],
+            treino[
+                "pace_alvo"
+            ],
+            treino[
+                "descricao"
+            ],
         )
 
         salvos += 1
+
         datas_existentes.add(
             data_texto
         )
 
-    return salvos, pulados
+    return (
+        salvos,
+        pulados,
+    )
 
 
 # =========================================================
@@ -2724,9 +3107,8 @@ with coach_tab:
     )
 
     st.caption(
-        "O plano usa seu histórico recente do Strava, "
-        "volume semanal, pace de referência, disponibilidade "
-        "e percepção de cansaço."
+        "O plano usa apenas sua carga recente, remove possíveis duplicatas "
+        "manual + Strava e limita progressão de volume e longão."
     )
 
     estado_coach = (
@@ -2756,6 +3138,13 @@ with coach_tab:
             f"{segundos_para_pace(estado_coach['pace_ref'])}/km"
         ),
     )
+
+    if estado_coach["modo_retorno"]:
+        st.info(
+            "Modo retorno ativo: o Coach está sendo conservador com "
+            "volume, longão e progressão porque ainda há pouco histórico "
+            "recente consistente."
+        )
 
     st.write("")
 
@@ -2927,11 +3316,8 @@ with coach_tab:
                 border=True
             ):
                 st.caption(
-                    treino[
-                        "data"
-                    ].strftime(
-                        "%A · %d/%m"
-                    )
+                    f"{dias_completos[treino['data'].weekday()]} · "
+                    f"{treino['data'].strftime('%d/%m')}"
                 )
 
                 st.markdown(
