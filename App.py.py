@@ -2107,6 +2107,225 @@ def atividades_recentes_coach(
     return itens
 
 
+def calibrar_paces_faceis_coach(
+    historico_df,
+    hoje_local,
+):
+    """
+    Cria faixas de pace para rodagem leve, recuperação e longão.
+
+    Prioridade:
+    1) treinos recentes com RPE <= 5;
+    2) treinos contínuos recentes sem RPE;
+    3) baseline inicial de 6:20/km.
+
+    O objetivo é evitar que o Coach transforme "leve" em
+    artificialmente lento quando o corredor já demonstrou que
+    corre confortavelmente mais rápido.
+    """
+    baseline = 6 * 60 + 20  # 6:20/km
+
+    if historico_df.empty:
+        centro = baseline
+        fonte = "baseline inicial"
+        amostra = 0
+        confianca = "inicial"
+
+    else:
+        df = deduplicar_historico_coach(
+            historico_df
+        )
+
+        limite = (
+            hoje_local
+            - timedelta(days=35)
+        )
+
+        df = df[
+            df["data_dt"] >= limite
+        ].copy()
+
+        df["pace_segundos"] = (
+            df["pace"].apply(
+                pace_para_segundos
+            )
+        )
+
+        # Só corridas contínuas. Intervalado, progressivo, tempo run
+        # e teste não entram na calibração do pace fácil.
+        tipos_continuos = {
+            "Rodagem leve",
+            "Recuperação",
+            "Longão",
+            "Corrida",
+            "Outro",
+        }
+
+        df = df[
+            df["tipo"].isin(
+                tipos_continuos
+            )
+        ].dropna(
+            subset=[
+                "pace_segundos"
+            ]
+        )
+
+        # Remove valores improváveis para evitar distorção por GPS,
+        # atividade mal classificada ou registro incorreto.
+        df = df[
+            (df["pace_segundos"] >= 300)
+            & (df["pace_segundos"] <= 480)
+        ]
+
+        com_rpe = pd.DataFrame()
+
+        if (
+            not df.empty
+            and "esforco" in df.columns
+        ):
+            rpe = pd.to_numeric(
+                df["esforco"],
+                errors="coerce",
+            )
+
+            com_rpe = df[
+                rpe.between(
+                    2,
+                    5,
+                    inclusive="both",
+                )
+            ].copy()
+
+        if not com_rpe.empty:
+            com_rpe = com_rpe.sort_values(
+                "data_plot",
+                ascending=False,
+            ).head(5)
+
+            mediana = int(
+                com_rpe[
+                    "pace_segundos"
+                ].median()
+            )
+
+            # Com mais de uma percepção registrada, confiamos
+            # diretamente nos dados recentes.
+            if len(com_rpe) >= 2:
+                centro = mediana
+                confianca = "alta"
+            else:
+                # Com apenas 1 RPE, mistura dado recente com baseline.
+                centro = int(
+                    round(
+                        mediana * 0.70
+                        + baseline * 0.30
+                    )
+                )
+                confianca = "média"
+
+            fonte = "treinos recentes com RPE <= 5"
+            amostra = int(
+                len(com_rpe)
+            )
+
+        elif not df.empty:
+            recentes = df.sort_values(
+                "data_plot",
+                ascending=False,
+            ).head(4)
+
+            mediana = int(
+                recentes[
+                    "pace_segundos"
+                ].median()
+            )
+
+            # Sem RPE, o dado entra com metade do peso.
+            centro = int(
+                round(
+                    mediana * 0.50
+                    + baseline * 0.50
+                )
+            )
+
+            fonte = "treinos contínuos recentes sem RPE suficiente"
+            amostra = int(
+                len(recentes)
+            )
+            confianca = "média/baixa"
+
+        else:
+            centro = baseline
+            fonte = "baseline inicial"
+            amostra = 0
+            confianca = "inicial"
+
+    # Mantém o centro em uma faixa plausível para o contexto atual.
+    centro = max(
+        330,
+        min(
+            430,
+            int(centro),
+        ),
+    )
+
+    rodagem_min = max(
+        300,
+        centro - 5,
+    )
+
+    rodagem_max = min(
+        480,
+        centro + 20,
+    )
+
+    recuperacao_min = max(
+        300,
+        centro + 10,
+    )
+
+    recuperacao_max = min(
+        480,
+        centro + 35,
+    )
+
+    longao_min = max(
+        300,
+        centro,
+    )
+
+    longao_max = min(
+        480,
+        centro + 25,
+    )
+
+    return {
+        "pace_central_estimado": (
+            f"{segundos_para_pace(centro)}/km"
+        ),
+        "rodagem_leve": (
+            f"{segundos_para_pace(rodagem_min)}–"
+            f"{segundos_para_pace(rodagem_max)}/km"
+        ),
+        "recuperacao": (
+            f"{segundos_para_pace(recuperacao_min)}–"
+            f"{segundos_para_pace(recuperacao_max)}/km"
+        ),
+        "longao_confortavel": (
+            f"{segundos_para_pace(longao_min)}–"
+            f"{segundos_para_pace(longao_max)}/km"
+        ),
+        "fonte": fonte,
+        "amostra": amostra,
+        "confianca": confianca,
+        "regra": (
+            "São referências de esforço, não obrigação. "
+            "Calor, subida, fadiga ou desconforto justificam pace mais lento."
+        ),
+    }
+
+
 def perfil_capacidade_coach(
     historico_df,
     planejamento_df,
@@ -2121,6 +2340,10 @@ def perfil_capacidade_coach(
         "fase": "retorno consistente aos treinos",
         "objetivo_atual": "5 km sub-25",
         "recorde_historico": "24:20",
+        "paces_faceis_calibrados": calibrar_paces_faceis_coach(
+            historico_df,
+            hoje_local,
+        ),
         "referencias_declaradas_pelo_corredor": {
             "rodagem_confortavel_recente": "aprox. 6:20/km",
             "corrida_continua_forte_atual": "aprox. 5:50–6:00/km por 6–7 km",
@@ -2741,6 +2964,10 @@ Crie uma semana de corrida para 5 km usando SOMENTE o JSON fornecido.
 Regras:
 - histórico recente + RPE valem mais que recorde antigo;
 - use perfil_de_capacidade_atual como baseline, não apenas pace médio das atividades;
+- para Rodagem leve, Recuperação e Longão, use preferencialmente as faixas de
+  paces_faceis_calibrados. Não prescreva deliberadamente mais lento que essas faixas
+  sem justificar por fadiga, desconforto, calor/subida relatados ou RPE recente alto;
+- pace fácil é guiado por esforço: a faixa é referência, não obrigação de relógio;
 - não reduza arbitrariamente um estímulo já tolerado; só faça isso se fadiga,
   desconforto, RPE alto ou dado recente justificar;
 - em intervalados, pace_medio_atividade inclui aquecimento/recuperação:
@@ -2756,6 +2983,8 @@ Regras:
 - máximo de sessões fortes = limite recebido; deixe >=48 h entre elas;
 - maior corrida recente é referência, não teto: quando fadiga/desconforto permitem,
   use a faixa longao_min_sugerido_km–longao_max_km para progressão controlada;
+- ao aumentar apenas a distância do longão, escreva "progressão de distância".
+  Reserve "progressivo" para treino em que o ritmo acelera ao longo da sessão;
 - volume total deve ficar dentro da faixa validada;
 - intervalado: distância = total aproximado corrido, com aquecimento/desaquecimento;
 - fadiga/desconforto altos reduzem intensidade;
@@ -4679,6 +4908,47 @@ with coach_tab:
                 f"{estimativa['pace_continuo_confortavel_mediano']}"
             )
 
+        paces_faceis = perfil_capacidade_tela.get(
+            "paces_faceis_calibrados"
+        )
+
+        if paces_faceis:
+            st.divider()
+
+            st.markdown(
+                "**Paces fáceis calibrados**"
+            )
+
+            p1, p2, p3 = st.columns(3)
+
+            p1.metric(
+                "Rodagem leve",
+                paces_faceis[
+                    "rodagem_leve"
+                ],
+            )
+
+            p2.metric(
+                "Recuperação",
+                paces_faceis[
+                    "recuperacao"
+                ],
+            )
+
+            p3.metric(
+                "Longão",
+                paces_faceis[
+                    "longao_confortavel"
+                ],
+            )
+
+            st.caption(
+                f"Fonte: {paces_faceis['fonte']} · "
+                f"amostra: {paces_faceis['amostra']} · "
+                f"confiança: {paces_faceis['confianca']}. "
+                "As faixas são referência de esforço, não obrigação."
+            )
+
         feedback_recente = perfil_capacidade_tela.get(
             "feedback_recente"
         )
@@ -4692,7 +4962,7 @@ with coach_tab:
 
         st.caption(
             "Conforme você registrar ou editar o RPE após os treinos, os dados recentes "
-            "passam a ter mais peso que essas referências iniciais."
+            "passam a ter mais peso que as referências iniciais."
         )
 
     if not OPENAI_API_KEY:
@@ -4960,7 +5230,7 @@ with coach_tab:
     st.divider()
     st.caption(
         "Modo econômico: 4 semanas resumidas + até 10 atividades recentes. "
-        "O Coach agora diferencia pace médio de atividade e ritmo de tiros, usa RPE "
-        "pós-treino e trata o maior longão recente como referência, não como teto. "
+        "O Coach diferencia pace médio e ritmo de tiros, usa RPE para calibrar os "
+        "paces fáceis e trata o maior longão recente como referência, não como teto. "
         "Nenhuma chamada à IA acontece ao abrir o app ou sincronizar o Strava."
     )
