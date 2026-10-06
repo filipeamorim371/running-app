@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 # =========================================================
@@ -18,35 +19,186 @@ import streamlit as st
 
 LOGO_PATH = Path("logo.png")
 
+# URL pública do mesmo escudo que está no repositório.
+# O parâmetro ?v= força Safari/iOS a buscar uma versão nova do ícone.
+IOS_ICON_URL = (
+    "https://raw.githubusercontent.com/"
+    "filipeamorim371/running-app/main/logo.png"
+    "?v=20261006-3"
+)
+
 st.set_page_config(
     page_title="Running",
-    page_icon=str(LOGO_PATH) if LOGO_PATH.exists() else "🏃",
+    page_icon=IOS_ICON_URL,
     layout="centered",
     initial_sidebar_state="collapsed",
 )
 
+
+def configurar_icone_iphone():
+    """
+    O favicon do Streamlit e o ícone da Tela de Início do iPhone
+    são coisas diferentes. Este trecho adiciona apple-touch-icon
+    e metadados mobile diretamente ao <head> da página.
+    """
+    components.html(
+        f"""
+        <script>
+        (() => {{
+            const doc = window.parent.document;
+            const iconUrl = "{IOS_ICON_URL}";
+
+            function upsertLink(rel, href, sizes = null) {{
+                let el = doc.querySelector(`link[rel="${{rel}}"]`);
+                if (!el) {{
+                    el = doc.createElement("link");
+                    el.setAttribute("rel", rel);
+                    doc.head.appendChild(el);
+                }}
+                el.setAttribute("href", href);
+                if (sizes) el.setAttribute("sizes", sizes);
+            }}
+
+            function upsertMeta(name, content) {{
+                let el = doc.querySelector(`meta[name="${{name}}"]`);
+                if (!el) {{
+                    el = doc.createElement("meta");
+                    el.setAttribute("name", name);
+                    doc.head.appendChild(el);
+                }}
+                el.setAttribute("content", content);
+            }}
+
+            upsertLink("apple-touch-icon", iconUrl, "180x180");
+            upsertLink("icon", iconUrl);
+
+            upsertMeta("apple-mobile-web-app-capable", "yes");
+            upsertMeta("apple-mobile-web-app-status-bar-style", "default");
+            upsertMeta("apple-mobile-web-app-title", "Running");
+            upsertMeta("mobile-web-app-capable", "yes");
+            upsertMeta("theme-color", "#7A263A");
+
+            doc.title = "Running";
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
+configurar_icone_iphone()
+
 st.markdown(
     """
     <style>
+    :root {
+        --flu-grena: #7A263A;
+        --flu-verde: #006B54;
+        --flu-verde-escuro: #00513F;
+        --flu-offwhite: #F8F7F4;
+        --flu-borda: rgba(122, 38, 58, 0.18);
+    }
+
+    .stApp {
+        background:
+            linear-gradient(
+                180deg,
+                rgba(122, 38, 58, 0.035) 0px,
+                rgba(0, 107, 84, 0.025) 170px,
+                transparent 360px
+            );
+    }
+
     .block-container {
         max-width: 840px;
         padding-top: 1.1rem;
         padding-bottom: 4rem;
     }
 
-    h1 { letter-spacing: -0.04em; }
-    h2, h3 { letter-spacing: -0.02em; }
+    h1 {
+        letter-spacing: -0.04em;
+        color: var(--flu-grena);
+    }
+
+    h2, h3 {
+        letter-spacing: -0.02em;
+    }
 
     div[data-testid="stMetric"] {
-        border: 1px solid rgba(128, 128, 128, 0.22);
+        border: 1px solid var(--flu-borda);
         padding: 14px;
         border-radius: 16px;
+        background: rgba(255, 255, 255, 0.72);
+        box-shadow: 0 3px 14px rgba(0, 0, 0, 0.035);
     }
 
     div[data-testid="stVerticalBlockBorderWrapper"] {
         border-radius: 18px;
+        border-color: rgba(0, 107, 84, 0.18);
+    }
+
+    /* Botões principais */
+    .stButton > button[kind="primary"],
+    .stFormSubmitButton > button[kind="primary"] {
+        background: var(--flu-grena);
+        border-color: var(--flu-grena);
+        color: white;
+    }
+
+    .stButton > button[kind="primary"]:hover,
+    .stFormSubmitButton > button[kind="primary"]:hover {
+        background: #651F30;
+        border-color: #651F30;
+        color: white;
+    }
+
+    /* Botões normais */
+    .stButton > button,
+    .stFormSubmitButton > button,
+    .stLinkButton > a {
+        border-radius: 12px;
+    }
+
+    /* Abas */
+    button[data-baseweb="tab"] {
+        font-weight: 650;
+    }
+
+    button[data-baseweb="tab"][aria-selected="true"] {
+        color: var(--flu-grena);
+    }
+
+    div[data-baseweb="tab-highlight"] {
+        background-color: var(--flu-verde) !important;
+    }
+
+    /* Barras de progresso */
+    div[data-testid="stProgress"] > div > div > div > div {
+        background-color: var(--flu-verde);
+    }
+
+    /* Inputs focados */
+    input:focus,
+    textarea:focus {
+        border-color: var(--flu-verde) !important;
+    }
+
+    /* Pequeno detalhe tricolor no topo */
+    .flu-strip {
+        height: 5px;
+        border-radius: 999px;
+        margin-bottom: 14px;
+        background: linear-gradient(
+            90deg,
+            var(--flu-grena) 0 38%,
+            white 38% 62%,
+            var(--flu-verde) 62% 100%
+        );
+        box-shadow: 0 1px 5px rgba(0,0,0,0.08);
     }
     </style>
+
+    <div class="flu-strip"></div>
     """,
     unsafe_allow_html=True,
 )
@@ -1822,7 +1974,7 @@ else:
 # =========================================================
 
 mostrar_marca(
-    "Treino, evolução e consistência."
+    "Treino, evolução e consistência. 🇭🇺"
 )
 
 mensagem = st.session_state.pop(
