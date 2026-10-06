@@ -2,4 +2,3 @@ streamlit>=1.65
 pandas
 plotly
 requests
-supabase>=2.24.0

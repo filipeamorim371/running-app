@@ -11,8 +11,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-from supabase import create_client
-from supabase.lib.client_options import ClientOptions
 
 
 # =========================================================
@@ -246,116 +244,164 @@ def validar_token_faceid(access_token):
 
 
 
+def _auth_admin_headers():
+    """
+    New Supabase sb_secret_* keys belong in the apikey header.
+    Legacy service_role JWTs also need Authorization: Bearer.
+    """
+    headers = {
+        "apikey": SUPABASE_SECRET,
+        "Content-Type": "application/json",
+    }
+
+    if str(
+        SUPABASE_SECRET
+    ).startswith("eyJ"):
+        headers[
+            "Authorization"
+        ] = (
+            f"Bearer {SUPABASE_SECRET}"
+        )
+
+    return headers
+
+
 def preparar_conta_faceid_no_servidor(password):
     """
-    Garante que exista um usuário Supabase Auth para FACEID_EMAIL,
+    Garante via Auth Admin REST que exista um usuário para FACEID_EMAIL,
     confirma o e-mail e define exatamente a senha informada.
 
-    A operação roda no servidor com SUPABASE_SECRET; a secret key
-    nunca é enviada ao navegador.
+    Fazemos HTTP direto para evitar dependências/versionamento do SDK Python.
+    A secret key continua somente no servidor Streamlit.
     """
     if not faceid_configurado():
-        return False, "Face ID ainda não está configurado nos Secrets."
+        return False, (
+            "Face ID ainda não está configurado nos Secrets."
+        )
 
     if not password or len(password) < 6:
-        return False, "Use uma senha com pelo menos 6 caracteres."
+        return False, (
+            "Use uma senha com pelo menos 6 caracteres."
+        )
+
+    auth_admin_url = (
+        f"{SUPABASE_URL}/auth/v1/admin/users"
+    )
+
+    headers = _auth_admin_headers()
 
     try:
-        admin_client = create_client(
-            SUPABASE_URL,
-            SUPABASE_SECRET,
-            options=ClientOptions(
-                auto_refresh_token=False,
-                persist_session=False,
-            ),
+        resposta_lista = requests.get(
+            auth_admin_url,
+            headers=headers,
+            params={
+                "page": 1,
+                "per_page": 1000,
+            },
+            timeout=20,
         )
 
-        resposta = admin_client.auth.admin.list_users(
-            page=1,
-            per_page=1000,
-        )
+        if not resposta_lista.ok:
+            detalhe = resposta_lista.text[:500]
 
-        if isinstance(resposta, list):
-            usuarios = resposta
-        elif isinstance(resposta, dict):
-            usuarios = resposta.get("users", [])
-        else:
-            usuarios = getattr(
-                resposta,
+            return False, (
+                "O Supabase recusou o acesso administrativo "
+                f"({resposta_lista.status_code}): {detalhe}"
+            )
+
+        payload = resposta_lista.json()
+
+        if isinstance(
+            payload,
+            dict,
+        ):
+            usuarios = payload.get(
                 "users",
                 [],
             )
+        elif isinstance(
+            payload,
+            list,
+        ):
+            usuarios = payload
+        else:
+            usuarios = []
 
-        usuario_encontrado = None
+        usuario_id = None
 
-        for usuario in usuarios or []:
-            if isinstance(usuario, dict):
-                email = str(
-                    usuario.get("email")
-                    or ""
-                ).strip().lower()
-
-                uid = usuario.get("id")
-            else:
-                email = str(
-                    getattr(
-                        usuario,
-                        "email",
-                        "",
-                    )
-                    or ""
-                ).strip().lower()
-
-                uid = getattr(
-                    usuario,
-                    "id",
-                    None,
+        for usuario in usuarios:
+            email_usuario = str(
+                usuario.get(
+                    "email",
+                    "",
                 )
+                or ""
+            ).strip().lower()
 
             if hmac.compare_digest(
-                email,
+                email_usuario,
                 FACEID_EMAIL,
             ):
-                usuario_encontrado = (
-                    uid
+                usuario_id = usuario.get(
+                    "id"
                 )
                 break
 
-        if usuario_encontrado:
-            admin_client.auth.admin.update_user_by_id(
-                str(
-                    usuario_encontrado
+        dados_usuario = {
+            "password": password,
+            "email_confirm": True,
+        }
+
+        if usuario_id:
+            resposta_usuario = requests.put(
+                (
+                    f"{auth_admin_url}/"
+                    f"{usuario_id}"
                 ),
-                {
-                    "password": password,
-                    "email_confirm": True,
-                },
+                headers=headers,
+                json=dados_usuario,
+                timeout=20,
             )
 
-            return True, (
-                "Conta de segurança atualizada e confirmada."
+            acao = "atualizar"
+
+        else:
+            dados_usuario[
+                "email"
+            ] = FACEID_EMAIL
+
+            resposta_usuario = requests.post(
+                auth_admin_url,
+                headers=headers,
+                json=dados_usuario,
+                timeout=20,
             )
 
-        admin_client.auth.admin.create_user(
-            {
-                "email": FACEID_EMAIL,
-                "password": password,
-                "email_confirm": True,
-            }
-        )
+            acao = "criar"
+
+        if not resposta_usuario.ok:
+            detalhe = resposta_usuario.text[:500]
+
+            return False, (
+                f"Não foi possível {acao} a conta no Supabase "
+                f"({resposta_usuario.status_code}): {detalhe}"
+            )
 
         return True, (
-            "Conta de segurança criada e confirmada."
+            "Conta de segurança preparada e confirmada. "
+            "Agora registre a passkey no iPhone."
+        )
+
+    except requests.RequestException as erro:
+        return False, (
+            "Falha de rede ao preparar a conta de segurança: "
+            f"{erro}"
         )
 
     except Exception as erro:
-        texto = str(
-            erro
-        )
-
         return False, (
-            "Não foi possível preparar a conta de segurança no Supabase: "
-            + texto[:500]
+            "Falha inesperada ao preparar a conta de segurança: "
+            f"{erro}"
         )
 
 
