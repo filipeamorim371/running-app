@@ -455,6 +455,8 @@ export default function(component) {
   const status = parentElement.querySelector('#passkey-status');
 
   const action = data?.action || 'signin';
+  const autoStart = Boolean(data?.auto_start);
+
   button.textContent = action === 'register'
     ? 'Registrar Face ID neste iPhone'
     : 'Entrar com Face ID';
@@ -464,7 +466,9 @@ export default function(component) {
     status.style.color = '#A61B29';
   };
 
-  button.onclick = async () => {
+  const runPasskey = async (automatic = false) => {
+    if (button.disabled) return;
+
     button.disabled = true;
     status.style.color = '';
     status.textContent = action === 'register'
@@ -543,7 +547,9 @@ export default function(component) {
       let friendly = raw;
 
       if (/cancel|abort|notallowed/i.test(raw)) {
-        friendly = 'Autenticação cancelada.';
+        friendly = automatic
+          ? 'Se o Face ID não abriu automaticamente, toque no botão abaixo.'
+          : 'Autenticação cancelada.';
       } else if (/passkey_disabled/i.test(raw)) {
         friendly = 'Passkeys ainda não foram ativadas no Supabase.';
       } else if (/credential.*exists/i.test(raw)) {
@@ -556,16 +562,38 @@ export default function(component) {
         friendly = 'A publishable key do Supabase parece estar incorreta.';
       }
 
-      showError(friendly);
-      setTriggerValue('auth_result', {
-        ok: false,
-        action,
-        error: friendly,
-      });
+      if (automatic) {
+        status.textContent = friendly;
+        status.style.color = '';
+      } else {
+        showError(friendly);
+
+        setTriggerValue('auth_result', {
+          ok: false,
+          action,
+          error: friendly,
+        });
+      }
     } finally {
       button.disabled = false;
     }
   };
+
+  button.onclick = () => runPasskey(false);
+
+  // Tenta abrir a passkey uma única vez por carregamento da página.
+  // Se o Safari/iOS exigir gesto do usuário, o botão manual permanece.
+  if (
+    action === 'signin'
+    && autoStart
+    && !window.__runningFaceIdAutoStarted
+  ) {
+    window.__runningFaceIdAutoStarted = true;
+
+    setTimeout(() => {
+      runPasskey(true);
+    }, 350);
+  }
 }
 """
 
@@ -584,6 +612,7 @@ def montar_passkey(
     action,
     key,
     password=None,
+    auto_start=False,
 ):
     if (
         not faceid_configurado()
@@ -596,6 +625,7 @@ def montar_passkey(
         "supabase_url": SUPABASE_URL,
         "publishable_key": SUPABASE_PUBLISHABLE_KEY,
         "email": FACEID_EMAIL,
+        "auto_start": bool(auto_start),
     }
 
     if password is not None:
@@ -646,11 +676,12 @@ def autenticar_app():
     mostrar_marca("Área privada")
 
     if faceid_configurado() and passkey_component is not None:
-        st.markdown("### Acesso rápido")
+        st.markdown("### Face ID")
 
         resultado_faceid = montar_passkey(
             action="signin",
             key="faceid_login",
+            auto_start=True,
         )
 
         evento_faceid = getattr(
