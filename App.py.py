@@ -1049,7 +1049,7 @@ def pace_referencia_recente(
 
     limite = (
         hoje_local
-        - timedelta(days=28)
+        - timedelta(days=20)
     )
 
     df = df[
@@ -1108,6 +1108,19 @@ def analisar_estado_coach(
     historico_df,
     hoje_local,
 ):
+    """
+    Para carga de treino, prioriza o que aconteceu AGORA.
+
+    Regra principal:
+    - última semana completa = âncora de volume;
+    - rolling 7 dias = informação complementar;
+    - se ainda não houver semana completa, usa rolling 7;
+    - atividades com mais de 21 dias não entram na carga recente.
+
+    Isso evita que uma semana completa de 36 km, por exemplo, seja
+    artificialmente reduzida só porque os últimos 7 dias atravessam
+    duas semanas de calendário.
+    """
     df = deduplicar_historico_coach(
         historico_df
     )
@@ -1119,40 +1132,40 @@ def analisar_estado_coach(
         )
     )
 
-    # Últimos 28 dias
-    inicio_28 = (
+    # Janela recente de carga: 21 dias.
+    inicio_21 = (
         hoje_local
-        - timedelta(days=27)
+        - timedelta(days=20)
     )
 
-    recentes_28 = (
+    recentes_21 = (
         df[
-            df["data_dt"] >= inicio_28
+            df["data_dt"] >= inicio_21
         ].copy()
         if not df.empty
         else pd.DataFrame()
     )
 
-    volume_28 = (
+    volume_21 = (
         float(
-            recentes_28[
+            recentes_21[
                 "distancia"
             ].sum()
         )
-        if not recentes_28.empty
+        if not recentes_21.empty
         else 0.0
     )
 
-    treinos_28 = len(
-        recentes_28
+    treinos_21 = len(
+        recentes_21
     )
 
-    # Semanas completas anteriores, sem usar a semana corrente.
+    # Últimas 3 semanas completas anteriores à semana atual.
     semanas = []
 
     for i in range(
         1,
-        5,
+        4,
     ):
         fim = (
             inicio_semana_atual
@@ -1191,28 +1204,22 @@ def analisar_estado_coach(
             }
         )
 
-    semanas_ativas = [
-        s
-        for s in semanas
-        if s["treinos"] > 0
-    ]
+    ultima_semana = semanas[0]
 
-    ultima_semana = (
-        semanas_ativas[0]
-        if semanas_ativas
-        else None
-    )
-
-    volume_ultima_semana = (
+    volume_ultima_semana = float(
         ultima_semana[
             "volume"
         ]
-        if ultima_semana
-        else 0.0
     )
 
-    # Rolling 7 dias funciona bem quando a pessoa voltou no meio
-    # de uma semana ou ainda não completou uma semana fechada.
+    treinos_ultima_semana = int(
+        ultima_semana[
+            "treinos"
+        ]
+    )
+
+    # Rolling 7 serve para contexto, não para sobrescrever
+    # uma semana completa válida.
     inicio_7 = (
         hoje_local
         - timedelta(days=6)
@@ -1226,50 +1233,64 @@ def analisar_estado_coach(
         )
     )
 
-    # Detecta fase de retorno / pouco histórico recente.
-    semanas_ativas_21 = 0
-
-    for s in semanas[:3]:
-        if s["treinos"] > 0:
-            semanas_ativas_21 += 1
-
-    modo_retorno = (
-        treinos_28 < 10
-        or semanas_ativas_21 <= 1
-    )
-
-    # Base principal: semana completa mais recente.
-    # Se não existir, usa rolling 7.
-    volume_base = (
-        volume_ultima_semana
-        if volume_ultima_semana > 0
-        else volume_ultimos_7
-    )
-
-    # Se os dois existem e divergem demais, usa o menor valor
-    # para não transformar um pico isolado em nova referência.
     if (
         volume_ultima_semana > 0
-        and volume_ultimos_7 > 0
+        and treinos_ultima_semana > 0
     ):
-        maior = max(
-            volume_ultima_semana,
-            volume_ultimos_7,
+        volume_base = (
+            volume_ultima_semana
         )
 
-        menor = min(
-            volume_ultima_semana,
-            volume_ultimos_7,
+        fonte_volume_base = (
+            "última semana completa"
         )
 
-        if maior > menor * 1.35:
-            volume_base = menor
+    elif volume_ultimos_7 > 0:
+        volume_base = (
+            volume_ultimos_7
+        )
 
-    if volume_base <= 0:
+        fonte_volume_base = (
+            "últimos 7 dias"
+        )
+
+    elif volume_21 > 0:
+        # Só entra como fallback quando não há semana completa nem
+        # rolling 7 aproveitável.
+        volume_base = min(
+            volume_21,
+            volume_21 / max(
+                1.0,
+                21 / 7,
+            ),
+        )
+
+        fonte_volume_base = (
+            "média da janela recente"
+        )
+
+    else:
         volume_base = 20.0
+        fonte_volume_base = (
+            "fallback inicial"
+        )
 
-    # Maior corrida dos últimos 14 dias:
-    # usada para limitar o longão da semana seguinte.
+    # Pouco histórico não reduz automaticamente a base:
+    # apenas sinaliza para a IA que estamos em retorno.
+    semanas_ativas_21 = sum(
+        1
+        for semana in semanas
+        if semana[
+            "treinos"
+        ] > 0
+    )
+
+    modo_retorno = (
+        treinos_21 < 10
+        or semanas_ativas_21 <= 2
+    )
+
+    # Maior corrida dos últimos 14 dias.
     inicio_14 = (
         hoje_local
         - timedelta(days=13)
@@ -1309,17 +1330,23 @@ def analisar_estado_coach(
         "volume_ultima_semana": float(
             volume_ultima_semana
         ),
+        "treinos_ultima_semana": int(
+            treinos_ultima_semana
+        ),
         "volume_ultimos_7": float(
             volume_ultimos_7
         ),
-        "volume_28": float(
-            volume_28
+        "volume_21": float(
+            volume_21
         ),
-        "treinos_28": int(
-            treinos_28
+        "treinos_21": int(
+            treinos_21
         ),
         "volume_base": float(
             volume_base
+        ),
+        "fonte_volume_base": (
+            fonte_volume_base
         ),
         "maior_corrida_14": float(
             maior_corrida_14
@@ -1331,6 +1358,7 @@ def analisar_estado_coach(
             modo_retorno
         ),
     }
+
 
 
 def arredondar_meio_km(valor):
@@ -1950,7 +1978,7 @@ def atividades_recentes_coach(
 
     df = df[
         df["data_dt"]
-        >= hoje_local - timedelta(days=56)
+        >= hoje_local - timedelta(days=20)
     ].copy()
 
     df = df.sort_values(
@@ -2364,7 +2392,7 @@ def perfil_capacidade_coach(
 
     limite = (
         hoje_local
-        - timedelta(days=35)
+        - timedelta(days=20)
     )
 
     recentes = df[
@@ -2568,7 +2596,7 @@ def aderencia_recente_coach(planejamento_df, historico_df, hoje_local):
             "aderencia_pct": None,
         }
 
-    inicio = hoje_local - timedelta(days=28)
+    inicio = hoje_local - timedelta(days=20)
     planos = planejamento_df[
         (planejamento_df["data_dt"] >= inicio)
         & (planejamento_df["data_dt"] <= hoje_local)
@@ -2609,25 +2637,25 @@ def limites_coach_ia(
         1.0,
     )
 
+    # A base é a última semana completa recente. Os perfis só
+    # modulam uma faixa ao redor dela; não recalculam a carga
+    # usando semanas antigas.
     if perfil_semana == "Conservador":
-        minimo = base * 0.75
-        maximo = min(
-            base * 1.03,
-            base + 2.0,
-        )
+        minimo = base * 0.80
+        maximo = base * 0.95
 
     elif perfil_semana == "Agressivo":
-        minimo = base * 0.90
+        minimo = base * 0.95
         maximo = min(
-            base * 1.18,
-            base + 5.0,
+            base * 1.10,
+            base + 4.0,
         )
 
     else:
-        minimo = base * 0.82
+        minimo = base * 0.90
         maximo = min(
-            base * 1.12,
-            base + 4.0,
+            base * 1.05,
+            base + 3.0,
         )
 
     if fadiga >= 8:
@@ -2644,7 +2672,7 @@ def limites_coach_ia(
     elif fadiga >= 6:
         maximo = min(
             maximo,
-            base * 0.98,
+            base * 0.95,
         )
 
     if desconforto == "Moderado/forte":
@@ -2801,13 +2829,69 @@ def contexto_coach_ia(
             "mensagem_do_corredor": mensagem_coach.strip() or None,
         },
         "estado_calculado": {
-            "volume_base_km": round(float(estado["volume_base"]), 1),
-            "volume_ultimos_7_km": round(float(estado["volume_ultimos_7"]), 1),
-            "volume_ultimos_28_km": round(float(estado["volume_28"]), 1),
-            "treinos_ultimos_28": int(estado["treinos_28"]),
-            "maior_corrida_14_dias_km": round(float(estado["maior_corrida_14"]), 1),
-            "pace_referencia": segundos_para_pace(estado["pace_ref"]),
-            "pouco_historico_recente": bool(estado["modo_retorno"]),
+            "ultima_semana_completa_km": round(
+                float(
+                    estado[
+                        "volume_ultima_semana"
+                    ]
+                ),
+                1,
+            ),
+            "treinos_ultima_semana_completa": int(
+                estado[
+                    "treinos_ultima_semana"
+                ]
+            ),
+            "volume_base_km": round(
+                float(
+                    estado[
+                        "volume_base"
+                    ]
+                ),
+                1,
+            ),
+            "fonte_volume_base": estado[
+                "fonte_volume_base"
+            ],
+            "volume_ultimos_7_km": round(
+                float(
+                    estado[
+                        "volume_ultimos_7"
+                    ]
+                ),
+                1,
+            ),
+            "volume_ultimos_21_km": round(
+                float(
+                    estado[
+                        "volume_21"
+                    ]
+                ),
+                1,
+            ),
+            "treinos_ultimos_21": int(
+                estado[
+                    "treinos_21"
+                ]
+            ),
+            "maior_corrida_14_dias_km": round(
+                float(
+                    estado[
+                        "maior_corrida_14"
+                    ]
+                ),
+                1,
+            ),
+            "pace_referencia": segundos_para_pace(
+                estado[
+                    "pace_ref"
+                ]
+            ),
+            "fase_de_retorno": bool(
+                estado[
+                    "modo_retorno"
+                ]
+            ),
         },
         "perfil_de_capacidade_atual": perfil_capacidade_coach(
             historico_df,
@@ -2817,7 +2901,7 @@ def contexto_coach_ia(
         "semanas_anteriores": resumo_semanal_coach(
             historico_df,
             hoje_local,
-            4,
+            3,
         ),
         "atividades_recentes": atividades_recentes_coach(
             historico_df,
@@ -2962,7 +3046,12 @@ def chamar_openai_coach(contexto):
 Crie uma semana de corrida para 5 km usando SOMENTE o JSON fornecido.
 
 Regras:
+- para CARGA, a última semana completa recente é a âncora principal;
+- corridas com mais de 21 dias não devem reduzir ou aumentar o volume da próxima semana;
+- histórico antigo e recorde servem apenas como contexto, não como fitness atual;
 - histórico recente + RPE valem mais que recorde antigo;
+- se estado_calculado.fonte_volume_base="última semana completa", trate
+  estado_calculado.volume_base_km como a referência real de carga;
 - use perfil_de_capacidade_atual como baseline, não apenas pace médio das atividades;
 - para Rodagem leve, Recuperação e Longão, use preferencialmente as faixas de
   paces_faceis_calibrados. Não prescreva deliberadamente mais lento que essas faixas
@@ -4856,18 +4945,25 @@ with coach_tab:
     c1, c2, c3 = st.columns(3)
 
     c1.metric(
-        "Base recente",
-        f"{estado_coach['volume_base']:.1f} km",
+        "Última semana completa",
+        f"{estado_coach['volume_ultima_semana']:.1f} km",
     )
 
     c2.metric(
-        "Últimos 28 dias",
-        f"{estado_coach['volume_28']:.1f} km",
+        "Últimos 7 dias",
+        f"{estado_coach['volume_ultimos_7']:.1f} km",
     )
 
     c3.metric(
-        "Pace referência",
-        f"{segundos_para_pace(estado_coach['pace_ref'])}/km",
+        "Base usada",
+        f"{estado_coach['volume_base']:.1f} km",
+    )
+
+    st.caption(
+        "Base de carga: "
+        f"{estado_coach['fonte_volume_base']}. "
+        "Para planejar volume, o Coach considera principalmente os últimos 21 dias; "
+        "corridas mais antigas ficam apenas como contexto histórico."
     )
 
     perfil_capacidade_tela = perfil_capacidade_coach(
@@ -4882,6 +4978,11 @@ with coach_tab:
         refs = perfil_capacidade_tela[
             "referencias_declaradas_pelo_corredor"
         ]
+
+        st.write(
+            "• Pace de referência calculado: "
+            f"{segundos_para_pace(estado_coach['pace_ref'])}/km"
+        )
 
         st.write(
             "• Rodagem confortável: "
@@ -5229,7 +5330,7 @@ with coach_tab:
 
     st.divider()
     st.caption(
-        "Modo econômico: 4 semanas resumidas + até 10 atividades recentes. "
+        "Modo econômico: 3 semanas resumidas + até 10 atividades dos últimos 21 dias. "
         "O Coach diferencia pace médio e ritmo de tiros, usa RPE para calibrar os "
         "paces fáceis e trata o maior longão recente como referência, não como teto. "
         "Nenhuma chamada à IA acontece ao abrir o app ou sincronizar o Strava."
