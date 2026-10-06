@@ -459,7 +459,7 @@ export default function(component) {
 
   button.textContent = action === 'register'
     ? 'Registrar Face ID neste iPhone'
-    : 'Entrar com Face ID';
+    : 'Desbloquear com Face ID';
 
   const showError = (message) => {
     status.textContent = message || 'Não foi possível concluir a autenticação.';
@@ -581,19 +581,6 @@ export default function(component) {
 
   button.onclick = () => runPasskey(false);
 
-  // Tenta abrir a passkey uma única vez por carregamento da página.
-  // Se o Safari/iOS exigir gesto do usuário, o botão manual permanece.
-  if (
-    action === 'signin'
-    && autoStart
-    && !window.__runningFaceIdAutoStarted
-  ) {
-    window.__runningFaceIdAutoStarted = true;
-
-    setTimeout(() => {
-      runPasskey(true);
-    }, 350);
-  }
 }
 """
 
@@ -676,12 +663,16 @@ def autenticar_app():
     mostrar_marca("Área privada")
 
     if faceid_configurado() and passkey_component is not None:
-        st.markdown("### Face ID")
+        st.markdown("### Desbloquear")
+
+        st.caption(
+            "Por segurança, o iPhone exige um toque antes de abrir o Face ID."
+        )
 
         resultado_faceid = montar_passkey(
             action="signin",
             key="faceid_login",
-            auto_start=True,
+            auto_start=False,
         )
 
         evento_faceid = getattr(
