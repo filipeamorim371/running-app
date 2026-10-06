@@ -173,7 +173,7 @@ except Exception:
 try:
     OPENAI_MODEL = st.secrets["openai"]["model"]
 except Exception:
-    OPENAI_MODEL = "gpt-5.6-terra"
+    OPENAI_MODEL = "gpt-6-luna"
 
 
 # =========================================================
@@ -1849,7 +1849,6 @@ def atividades_recentes_coach(historico_df, hoje_local, limite=24):
             "tipo_registrado": str(treino.get("tipo", "Corrida")),
             "distancia_km": round(float(treino.get("distancia", 0) or 0), 2),
             "pace_medio": treino.get("pace") or None,
-            "origem": treino.get("origem") or None,
         }
 
         for origem_coluna, destino in [
@@ -1991,8 +1990,8 @@ def contexto_coach_ia(
             "pace_referencia": segundos_para_pace(estado["pace_ref"]),
             "pouco_historico_recente": bool(estado["modo_retorno"]),
         },
-        "semanas_anteriores": resumo_semanal_coach(historico_df, hoje_local, 8),
-        "atividades_recentes": atividades_recentes_coach(historico_df, hoje_local, 24),
+        "semanas_anteriores": resumo_semanal_coach(historico_df, hoje_local, 4),
+        "atividades_recentes": atividades_recentes_coach(historico_df, hoje_local, 10),
         "aderencia_28_dias": aderencia_recente_coach(
             planejamento_df,
             historico_df,
@@ -2084,6 +2083,38 @@ def extrair_texto_responses_api(payload_resposta):
     raise RuntimeError("A API não retornou um plano em texto estruturado.")
 
 
+def estimar_custo_openai(uso):
+    """
+    Estimativa para gpt-6-luna usando as tarifas configuradas nesta versão.
+    O valor é apenas informativo; a cobrança real é a da conta OpenAI.
+    """
+    if not uso:
+        return None
+
+    if OPENAI_MODEL != "gpt-6-luna":
+        return None
+
+    entrada = int(uso.get("input_tokens", 0) or 0)
+    saida = int(uso.get("output_tokens", 0) or 0)
+
+    detalhes_entrada = uso.get("input_tokens_details") or {}
+    cache = int(detalhes_entrada.get("cached_tokens", 0) or 0)
+    entrada_nao_cache = max(0, entrada - cache)
+
+    # USD por 1 milhão de tokens
+    preco_entrada = 0.10
+    preco_cache = 0.01
+    preco_saida = 0.50
+
+    custo = (
+        entrada_nao_cache * preco_entrada
+        + cache * preco_cache
+        + saida * preco_saida
+    ) / 1_000_000
+
+    return custo
+
+
 def chamar_openai_coach(contexto):
     if not OPENAI_API_KEY:
         raise RuntimeError(
@@ -2093,29 +2124,30 @@ def chamar_openai_coach(contexto):
     datas_permitidas = contexto["pedido_para_proxima_semana"]["datas_disponiveis"]
     schema = esquema_resposta_coach_ia(datas_permitidas)
 
+    # Prompt deliberadamente curto e estável para reduzir tokens e favorecer cache.
     instrucoes = """
-Você é o motor de planejamento de um aplicativo pessoal de corrida.
-Sua função é criar UMA semana de treino coerente com os dados fornecidos.
+Crie uma semana de corrida para 5 km usando SOMENTE o JSON fornecido.
 
-Princípios obrigatórios:
-- Use o histórico real como contexto. Não trate recorde pessoal antigo como condicionamento atual.
-- Priorize consistência e especificidade para 5 km, não volume por volume.
-- Diferencie pace médio de uma atividade de pace das repetições de um intervalado.
-- Não invente dados ausentes (FC, RPE, lesões, provas recentes).
-- Respeite exatamente as datas disponíveis e o número de treinos solicitado.
-- Respeite todos os limites obrigatórios recebidos no JSON.
-- No máximo o número permitido de sessões fortes.
-- Sessões fortes devem ficar separadas por pelo menos 48 horas.
-- O longão não pode ultrapassar longao_max_km.
-- O volume semanal deve ficar entre volume_min_km e volume_max_km.
-- A distância mostrada para intervalados deve representar aproximadamente o total corrido, incluindo aquecimento e desaquecimento.
-- Pace de rodagem leve deve ser confortável. Não force pace apenas para cumprir número.
-- Para meta sub-25, use trabalho específico de forma progressiva, sem transformar toda semana em teste.
-- Se fadiga estiver alta ou houver desconforto moderado/forte, reduza ou remova intensidade.
-- Não diagnostique nem trate condições médicas. Se houver desconforto relevante, use o campo alerta para recomendar cautela.
-- Explique de modo breve por que a semana faz sentido à luz do histórico.
-- Responda somente no schema estruturado solicitado.
+Regras:
+- histórico recente vale mais que recorde antigo;
+- respeite datas, número de treinos e todos os limites;
+- máximo de sessões fortes = limite recebido; deixe >=48 h entre elas;
+- longão <= limite; volume dentro da faixa;
+- intervalado: distância = total aproximado corrido, com aquecimento/desaquecimento;
+- não confunda pace médio da atividade com pace dos tiros;
+- fadiga/desconforto altos reduzem intensidade;
+- não invente FC, RPE, lesão ou desempenho;
+- foco: consistência + evolução específica para 5 km sub-25;
+- seja conciso: leitura/estratégia <= 30 palavras cada; alerta <= 20;
+  objetivo e justificativa de cada treino <= 12 palavras cada;
+- responda apenas no JSON estruturado solicitado.
 """.strip()
+
+    entrada_compacta = json.dumps(
+        contexto,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
     resposta = requests.post(
         "https://api.openai.com/v1/responses",
@@ -2125,9 +2157,14 @@ Princípios obrigatórios:
         },
         json={
             "model": OPENAI_MODEL,
-            "reasoning": {"effort": "medium"},
+            # Luna suporta "none": evita gastar tokens de raciocínio
+            # quando o problema já chega estruturado pelo Python.
+            "reasoning": {"effort": "none"},
+            # Limite suficiente para 3–5 treinos em JSON, evitando respostas longas.
+            "max_output_tokens": 1200,
+            "store": False,
             "instructions": instrucoes,
-            "input": json.dumps(contexto, ensure_ascii=False),
+            "input": entrada_compacta,
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -2142,12 +2179,33 @@ Princípios obrigatórios:
 
     if not resposta.ok:
         detalhe = resposta.text[:800]
+
+        if resposta.status_code == 429 and (
+            "insufficient_quota" in detalhe
+            or "credit_balance_exhausted" in detalhe
+        ):
+            raise RuntimeError(
+                "A conexão com a OpenAI está funcionando, mas o saldo da API acabou."
+            )
+
         raise RuntimeError(
             f"OpenAI API respondeu {resposta.status_code}: {detalhe}"
         )
 
-    texto = extrair_texto_responses_api(resposta.json())
-    return json.loads(texto)
+    payload = resposta.json()
+    texto = extrair_texto_responses_api(payload)
+    uso = payload.get("usage") or {}
+
+    resumo_uso = {
+        "modelo": payload.get("model") or OPENAI_MODEL,
+        "input_tokens": int(uso.get("input_tokens", 0) or 0),
+        "output_tokens": int(uso.get("output_tokens", 0) or 0),
+        "total_tokens": int(uso.get("total_tokens", 0) or 0),
+        "input_tokens_details": uso.get("input_tokens_details") or {},
+    }
+    resumo_uso["custo_estimado_usd"] = estimar_custo_openai(resumo_uso)
+
+    return json.loads(texto), resumo_uso
 
 
 def validar_plano_coach_ia(plano, contexto):
@@ -2243,7 +2301,7 @@ def plano_ia_para_planejamento(plano_ia):
 
 
 def gerar_plano_com_ia(contexto):
-    plano = chamar_openai_coach(contexto)
+    plano, uso = chamar_openai_coach(contexto)
     erros = validar_plano_coach_ia(plano, contexto)
 
     if erros:
@@ -2252,7 +2310,7 @@ def gerar_plano_com_ia(contexto):
             + " ".join(erros)
         )
 
-    return plano
+    return plano, uso
 
 
 # =========================================================
@@ -3731,9 +3789,9 @@ with coach_tab:
     st.subheader("Coach IA")
 
     st.caption(
-        "O Coach cruza seu histórico sincronizado, carga recente, disponibilidade "
-        "e check-in. A IA propõe a semana; um validador independente bloqueia "
-        "planos fora dos limites definidos pelo app."
+        "O Coach cruza seu histórico recente, disponibilidade e check-in. "
+        "Para economizar créditos, o Python resume os dados primeiro e a IA "
+        "é chamada somente quando você toca em Gerar."
     )
 
     estado_coach = analisar_estado_coach(
@@ -3765,7 +3823,7 @@ with coach_tab:
         )
 
         st.code(
-            '[openai]\napi_key = "SUA_CHAVE_AQUI"\nmodel = "gpt-5.6-terra"',
+            '[openai]\napi_key = "SUA_CHAVE_AQUI"\nmodel = "gpt-6-luna"',
             language="toml",
         )
 
@@ -3876,10 +3934,11 @@ with coach_tab:
                     with st.spinner(
                         "Analisando seu histórico e montando a semana..."
                     ):
-                        plano_ia = gerar_plano_com_ia(contexto)
+                        plano_ia, uso_api = gerar_plano_com_ia(contexto)
 
                     st.session_state["coach_ia_resultado"] = plano_ia
                     st.session_state["coach_ia_contexto"] = contexto
+                    st.session_state["coach_ia_uso"] = uso_api
                     st.session_state["plano_coach"] = plano_ia_para_planejamento(plano_ia)
                     st.rerun()
 
@@ -3892,6 +3951,7 @@ with coach_tab:
     resultado_ia = st.session_state.get("coach_ia_resultado")
     plano_coach = st.session_state.get("plano_coach")
     contexto_ia = st.session_state.get("coach_ia_contexto")
+    uso_ia = st.session_state.get("coach_ia_uso")
 
     if resultado_ia and plano_coach:
         st.divider()
@@ -3921,6 +3981,16 @@ with coach_tab:
 
         if resultado_ia.get("alerta"):
             st.info(resultado_ia["alerta"])
+
+        if uso_ia:
+            custo = uso_ia.get("custo_estimado_usd")
+            texto_uso = (
+                f"API desta geração: {uso_ia.get('input_tokens', 0)} tokens de entrada + "
+                f"{uso_ia.get('output_tokens', 0)} de saída"
+            )
+            if custo is not None:
+                texto_uso += f" · custo estimado: US$ {custo:.6f}"
+            st.caption(texto_uso)
 
         for treino in plano_coach:
             with st.container(border=True):
@@ -3967,6 +4037,7 @@ with coach_tab:
                     "plano_coach",
                     "coach_ia_resultado",
                     "coach_ia_contexto",
+                    "coach_ia_uso",
                 ]:
                     st.session_state.pop(chave, None)
 
@@ -3994,12 +4065,14 @@ with coach_tab:
                 "plano_coach",
                 "coach_ia_resultado",
                 "coach_ia_contexto",
+                "coach_ia_uso",
             ]:
                 st.session_state.pop(chave, None)
             st.rerun()
 
     st.divider()
     st.caption(
-        "O Coach usa IA para interpretar contexto, mas não deixa a IA gravar "
-        "treinos diretamente. O plano só entra no calendário depois da sua aprovação."
+        "Modo econômico: 4 semanas resumidas + até 10 atividades recentes, "
+        "raciocínio desativado e resposta limitada. Nenhuma chamada à IA acontece "
+        "ao abrir o app ou sincronizar o Strava."
     )
