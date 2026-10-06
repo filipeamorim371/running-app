@@ -447,17 +447,55 @@ def excluir_treino(id_treino):
     )
 
 
+def separar_observacao_feedback(observacao):
+    """
+    Separa a observação original do treino do feedback pós-treino
+    criado pelo app. Isso permite editar o feedback depois sem
+    duplicar texto nem apagar a observação importada do Strava.
+    """
+    if (
+        observacao is None
+        or pd.isna(observacao)
+    ):
+        return "", ""
+
+    texto = str(observacao).strip()
+
+    marcador = "Feedback pós-treino:"
+
+    if marcador not in texto:
+        return texto, ""
+
+    antes, depois = texto.split(
+        marcador,
+        1,
+    )
+
+    base = antes.rstrip(
+        " |"
+    ).strip()
+
+    feedback = depois.strip()
+
+    # Se houver algum separador antigo depois do feedback,
+    # preservamos apenas o conteúdo do feedback.
+    if " | " in feedback:
+        feedback = feedback.split(
+            " | ",
+            1,
+        )[0].strip()
+
+    return base, feedback
+
+
 def atualizar_feedback_treino(
     id_treino,
     esforco,
     observacao_atual=None,
     feedback=None,
 ):
-    observacao = (
-        str(observacao_atual).strip()
-        if observacao_atual
-        and not pd.isna(observacao_atual)
-        else ""
+    observacao_base, _ = separar_observacao_feedback(
+        observacao_atual
     )
 
     feedback = (
@@ -466,22 +504,32 @@ def atualizar_feedback_treino(
         else ""
     )
 
-    if feedback:
-        complemento = f"Feedback pós-treino: {feedback}"
+    partes = []
 
-        if complemento not in observacao:
-            observacao = (
-                f"{observacao} | {complemento}"
-                if observacao
-                else complemento
-            )
+    if observacao_base:
+        partes.append(
+            observacao_base
+        )
+
+    if feedback:
+        partes.append(
+            f"Feedback pós-treino: {feedback}"
+        )
+
+    observacao_final = (
+        " | ".join(partes)
+        if partes
+        else None
+    )
 
     return supabase_update(
         "treinos",
-        {"id": f"eq.{int(id_treino)}"},
+        {
+            "id": f"eq.{int(id_treino)}"
+        },
         {
             "esforco": int(esforco),
-            "observacao": observacao or None,
+            "observacao": observacao_final,
         },
     )
 
@@ -4004,76 +4052,105 @@ with historico_tab:
                     )
                 )
 
+                observacao_base, feedback_atual = (
+                    separar_observacao_feedback(
+                        treino.get(
+                            "observacao"
+                        )
+                    )
+                )
+
                 if tem_rpe:
                     st.caption(
                         f"Esforço percebido: "
                         f"{int(float(esforco_atual))}/10"
                     )
 
-                if treino.get(
-                    "observacao"
-                ):
+                if observacao_base:
                     st.caption(
-                        treino[
-                            "observacao"
-                        ]
+                        observacao_base
                     )
 
-                if not tem_rpe:
-                    with st.expander(
-                        "Como foi esse treino?"
+                if feedback_atual:
+                    st.caption(
+                        f"Seu feedback: {feedback_atual}"
+                    )
+
+                titulo_feedback = (
+                    "Editar percepção do treino"
+                    if tem_rpe
+                    else "Como foi esse treino?"
+                )
+
+                with st.expander(
+                    titulo_feedback
+                ):
+                    st.caption(
+                        "Você pode alterar o RPE e o comentário a qualquer momento. "
+                        "O Coach sempre usará a versão mais recente."
+                    )
+
+                    with st.form(
+                        f"feedback_treino_{int(treino['id'])}"
                     ):
-                        st.caption(
-                            "Esse feedback ajuda o Coach a entender se "
-                            "o estímulo foi fácil, adequado ou pesado."
+                        valor_inicial_rpe = (
+                            int(
+                                float(
+                                    esforco_atual
+                                )
+                            )
+                            if tem_rpe
+                            else 5
                         )
 
-                        with st.form(
-                            f"feedback_treino_{int(treino['id'])}"
-                        ):
-                            rpe_feedback = st.slider(
-                                "Esforço percebido (RPE)",
-                                min_value=1,
-                                max_value=10,
-                                value=5,
-                                help=(
-                                    "1 = muito fácil; 10 = esforço máximo."
+                        rpe_feedback = st.slider(
+                            "Esforço percebido (RPE)",
+                            min_value=1,
+                            max_value=10,
+                            value=valor_inicial_rpe,
+                            help=(
+                                "1 = muito fácil; 10 = esforço máximo."
+                            ),
+                        )
+
+                        nota_feedback = st.text_input(
+                            "Comentário opcional",
+                            value=feedback_atual,
+                            placeholder=(
+                                "Ex.: sobrou bastante; pernas pesadas; "
+                                "tiros controlados."
+                            ),
+                        )
+
+                        salvar_feedback = (
+                            st.form_submit_button(
+                                (
+                                    "Atualizar percepção"
+                                    if tem_rpe
+                                    else "Salvar percepção"
                                 ),
+                                width="stretch",
                             )
+                        )
 
-                            nota_feedback = st.text_input(
-                                "Comentário opcional",
-                                placeholder=(
-                                    "Ex.: sobrou bastante; pernas pesadas; "
-                                    "tiros controlados."
+                        if salvar_feedback:
+                            atualizar_feedback_treino(
+                                treino["id"],
+                                rpe_feedback,
+                                treino.get(
+                                    "observacao"
                                 ),
+                                nota_feedback,
                             )
 
-                            salvar_feedback = (
-                                st.form_submit_button(
-                                    "Salvar feedback",
-                                    width="stretch",
-                                )
+                            st.session_state[
+                                "mensagem"
+                            ] = (
+                                "Percepção do treino atualizada. "
+                                "O Coach usará a versão mais recente."
                             )
 
-                            if salvar_feedback:
-                                atualizar_feedback_treino(
-                                    treino["id"],
-                                    rpe_feedback,
-                                    treino.get(
-                                        "observacao"
-                                    ),
-                                    nota_feedback,
-                                )
-
-                                st.session_state[
-                                    "mensagem"
-                                ] = (
-                                    "Feedback salvo. O Coach usará "
-                                    "essa informação nos próximos planos."
-                                )
-
-                                st.rerun()
+                            st.rerun()
 
 
 # =========================================================
@@ -4480,7 +4557,7 @@ with coach_tab:
             )
 
         st.caption(
-            "Conforme você registrar RPE após os treinos, os dados recentes "
+            "Conforme você registrar ou editar o RPE após os treinos, os dados recentes "
             "passam a ter mais peso que essas referências iniciais."
         )
 
